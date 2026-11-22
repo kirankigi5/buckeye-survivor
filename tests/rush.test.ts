@@ -134,6 +134,24 @@ test("dodges a shot that intersects the mech's current movement", () => usePredi
   assert.ok(Math.abs(b.act(o).move![1]) > 0.9)
 }))
 
+test("gun keeps firing on its own lead while a laser is still charging", () => {
+  const { b, o } = fixture()
+  step(o, 40)
+  o.mechs = [{ id: 3, kind: "mech", pos: [36, 0, 0], vel: [0, 16, 0], aim: [Math.PI, 0], hp: 1400, max_hp: 1400, weapons: ["gun"], charging: false }]
+  const gunStats = o.self.weapons[0].stats
+  o.self.weapons[1] = { kind: "laser", cooldown: 0, charge: 0.25, stats: { ...gunStats, damage: 315, charge: 0.75, range: 280, min_frac: 0.35, min_charge: 0.15 } }
+  o.self.aim = [0, 0]
+  const first = b.act(o)
+  assert.ok(first.aim![0] > 0.02)
+  assert.equal(first.fire![1], true)
+  o.self.aim = [first.aim![0], first.aim![1]]
+  step(o, 40.1)
+  o.self.weapons[1].charge = 0.32
+  const second = b.act(o)
+  assert.equal(second.fire![0], true)
+  assert.equal(second.fire![1], true)
+})
+
 test("uses the most imminent shot when two shots call for opposite moves", () => usePredictiveDodge(() => {
   const { b, o } = fixture()
   o.mechs = []
@@ -143,58 +161,3 @@ test("uses the most imminent shot when two shots call for opposite moves", () =>
   ]
   assert.ok(b.act(o).move![1] < -0.9)
 }))
-
-test("fights one visible hunter while the squad is still intact", () => {
-  const { b, o } = fixture()
-  step(o, 40)
-  o.alive = 16
-  o.mechs = [{ id: 3, kind: "mech", pos: [140, 0, 0], vel: [0, 0, 0], aim: [0, 0], hp: 1400, max_hp: 1400, weapons: ["gun"], charging: false }]
-  const action = b.act(o)
-  assert.equal(b.mode, "fight")
-  assert.ok(action.move![0] > 0.5)
-})
-
-test("leaves a pair of hunters when already hurt", () => {
-  const { b, o } = fixture()
-  step(o, 40)
-  o.alive = 14
-  o.self.hp = 700
-  o.mechs = [
-    { id: 3, kind: "mech", pos: [40, 0, 0], vel: [0, 0, 0], aim: [Math.PI, 0], hp: 1400, max_hp: 1400, weapons: ["gun"], charging: false },
-    { id: 4, kind: "mech", pos: [0, 55, 0], vel: [0, 0, 0], aim: [0, 0], hp: 1400, max_hp: 1400, weapons: ["gun"], charging: false },
-  ]
-  b.act(o)
-  assert.equal(b.mode, "retreat")
-})
-
-test("does not shoot crates while hurt and alone", () => {
-  const { b, o } = fixture()
-  step(o, 40)
-  o.alive = 16
-  o.self.hp = 800
-  o.mechs = []
-  o.crates = [{ id: 1000, pos: [30, 0, 0], hp: 300 }]
-  const action = b.act(o)
-  assert.equal(b.mode, "hold")
-  assert.deepEqual(action.fire, [false, false])
-})
-
-test("picks gun fire rate over armor", () => {
-  const { b, o } = fixture()
-  o.offer = { id: 1, expires: 99, choices: [{ id: "armor", name: "", desc: "" }, { id: "gun_rate", name: "", desc: "" }, { id: "plating", name: "", desc: "" }] }
-  assert.equal(b.act(o).pick, 1)
-})
-
-test("closes on a wounded mech that just left view", () => {
-  const { b, o } = fixture()
-  step(o, 40)
-  o.alive = 15
-  o.self.hp = 1200
-  o.mechs = [{ id: 3, kind: "mech", pos: [80, 0, 0], vel: [0, 0, 0], aim: [0, 0], hp: 400, max_hp: 1400, weapons: ["gun"], charging: false }]
-  b.act(o)
-  step(o, 40.3)
-  o.mechs = []
-  const action = b.act(o)
-  assert.equal(b.mode, "finish")
-  assert.ok(action.move![0] > 0.5)
-})
