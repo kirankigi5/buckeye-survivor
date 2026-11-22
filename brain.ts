@@ -112,6 +112,17 @@ export class Brain {
   scale(cubes: number) {
     return 1 + (this.cfg.cubes.size_per_cube ?? 0.05) * (cubes || 0)
   }
+  /** Beam damage at this charge: upgrade stats, cube bonus, and cook-off on a mortar carrier. */
+  beamHurt(laser: WeaponObs, charge: number, mortar: boolean, cubes: number): number {
+    const full = laser.stats.charge || 0.75
+    const minFrac = laser.stats.min_frac ?? 0.35
+    const frac = minFrac + (1 - minFrac) * clamp(charge / full, 0, 1)
+    const per = this.cfg.cubes?.damage_per_cube ?? 0.04
+    const cap = this.cfg.cubes?.stat_cap ?? 10
+    let dmg = (laser.stats.damage ?? 315) * frac * (1 + per * Math.min(Math.max(0, cubes), cap))
+    if (mortar) dmg *= 1 + (this.cfg.weapons?.laser?.cookoff ?? 0.6)
+    return dmg
+  }
   los(a: number[], b: number[]) {
     return this.world ? this.world.los(a, b) : true
   }
@@ -1043,7 +1054,29 @@ export class Brain {
           const vl = Math.sqrt(vv)
           let nx = -vy / vl, ny = vx / vl
           if (nx * cx + ny * cy > 0) { nx = -nx; ny = -ny }
-          if (OPT.predictDodge) dodge = { time: tca, direction: [nx, ny] }
+          if (OPT.predictDodge) {
+            // Rear hits are 1.5x. A sidestep that runs at a mech behind the torso is worse than a wider step.
+            const face = fightTarget ? Math.atan2(fightTarget.pos[1] - p[1], fightTarget.pos[0] - p[0]) : me.aim[0]
+            const halfFront = ((this.cfg.mech?.front_arc_deg ?? 180) * Math.PI / 180) / 2
+            let backX = 0, backY = 0
+            for (const e of mechs) {
+              const od = d2(e.pos, p)
+              if (od > 150 || od < 1) continue
+              const bearing = Math.atan2(e.pos[1] - p[1], e.pos[0] - p[0])
+              if (Math.abs(angDiff(bearing, face)) < halfFront) continue
+              backX += (e.pos[0] - p[0]) / od
+              backY += (e.pos[1] - p[1]) / od
+            }
+            const intoBack = nx * backX + ny * backY
+            if (intoBack > 0.15) {
+              nx = nx - backX * intoBack + Math.cos(face) * 0.45
+              ny = ny - backY * intoBack + Math.sin(face) * 0.45
+              const nl = Math.hypot(nx, ny) || 1
+              nx /= nl
+              ny /= nl
+            }
+            dodge = { time: tca, direction: [nx, ny] }
+          }
           else {
             const dir = this.freeDir(p, [nx, ny])
             moveDir = [moveDir[0] * 0.3 + dir[0], moveDir[1] * 0.3 + dir[1]]
@@ -1176,11 +1209,15 @@ export class Brain {
         if (charge > 0) {
           if (this.laserHoldStart < 0) this.laserHoldStart = t
           const lead = this.leadPoint(muzzle, e, 1e9, 0.0)
-          const ready = charge >= full - 0.06
           const on = los && this.onTarget(me, muzzle, lead, hw * 0.9, hh)
-          // release (fire) when fully charged and on target
-          if (ready && on) fire[laserSlot] = false
-          else if (t - this.laserHoldStart > full + 1.6) fire[laserSlot] = false
+          const minCharge = laser.stats.min_charge ?? 0.15
+          const hurt = this.beamHurt(laser, Math.max(charge, minCharge), e.weapons.includes("mortar"), me.cubes)
+          const lethal = hurt >= e.hp
+          const fullReady = charge >= full - 0.06
+          // Let go only for a full beam or one that finishes them. A visible target
+          // is never dumped on a timer; a hidden one still is, so we are not stuck slow.
+          if (charge >= minCharge && on && (fullReady || lethal)) fire[laserSlot] = false
+          else if (!los && t - this.laserHoldStart > full + 1.6) fire[laserSlot] = false
           else fire[laserSlot] = true
         } else {
           this.laserHoldStart = -1
