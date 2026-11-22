@@ -62,6 +62,9 @@ export class Brain {
   strafeFlipT = 0
   laserHoldStart = -1
   retreatUntil = -1
+  kiteUntil = -1
+  kiteDir: number[] | null = null
+  quietAfter = -1
   retreatSpot: number[] | null = null
   retreatSpotT = -100
   retreatHp = 0.6
@@ -614,7 +617,8 @@ export class Brain {
       for (const e of npcs) {
         const dd = d2(e.pos, p)
         const attacker = this.attackers.has(e.id) && t - this.attackers.get(e.id)!.t < 4
-        const farm = !lateCaution && (OPT.farm || !OPT.stealth) && !mechThreatNear && hpFrac > (OPT.farm ? 0.45 : 0.55) && dd < (OPT.farm ? 130 : 90) && (gunOk || ltg || laser || (gun && hpFrac > 0.7)) && !zoneUrgent
+        const farmSafe = !mechs.some((o) => d2(o.pos, p) < 82)
+        const farm = !lateCaution && farmSafe && (OPT.farm || !OPT.stealth) && hpFrac > (OPT.farm ? 0.45 : 0.55) && dd < 36 && (gunOk || ltg || laser || (gun && hpFrac > 0.7)) && !zoneUrgent
         if ((attacker || farm) && visibleNow.has(e.id) && hasLos(e) && dd < bd) { bd = dd; npcTarget = e }
       }
     }
@@ -772,12 +776,29 @@ export class Brain {
     }
     if (retreatNow) this.retreatUntil = t + 2.5
     const retreat = t < this.retreatUntil && z.next_radius > 30 && !(target && target.hp / target.maxHp < 0.15 && hasLos(target))
+    const losingTrade = taken6 > dealt6 * 1.7 + 160 || hpFrac < 0.36
+    if (losingTrade && !zoneUrgent) {
+      const hits = this.threatBearings.filter((b) => b.kind === "damage" && t - b.t < 2.6)
+      let sx = 0, sy = 0
+      for (const h of hits) { sx -= Math.cos(h.bearing); sy -= Math.sin(h.bearing) }
+      if (sx === 0 && sy === 0 && target) { sx = p[0] - target.pos[0]; sy = p[1] - target.pos[1] }
+      const L = Math.hypot(sx, sy)
+      if (L > 0.2) {
+        this.kiteDir = [sx / L, sy / L]
+        this.kiteUntil = t + 1.8
+        this.quietAfter = t + 4.4
+      }
+    }
 
     if (zoneUrgent && !(fightTarget && !outsideNow && tOut > needT * 1.2 + 3)) {
       this.mode = "zone"
       moveDir = this.navTo(obs, safePt, inCombat ? [] : avoid)
       const threatClose = mechs.some((e) => d2(e.pos, p) < 160)
       boost = (outsideNow && (z.dps >= 35 || needT > 3)) || needT * 1.15 + 2 > tOut || (me.energy > 90 && needT > 6 && !threatClose)
+    } else if (t < this.kiteUntil && this.kiteDir) {
+      this.mode = "kite"
+      moveDir = this.freeDir(p, this.kiteDir)
+      boost = me.energy > 12
     } else if (equipGoal && !retreat) {
       this.mode = "equip"
       moveDir = this.navTo(obs, equipGoal.pos, avoid)
@@ -950,16 +971,16 @@ export class Brain {
           if (dd < bd && ptOk(c.pos)) { bd = dd; goal = [c.pos[0], c.pos[1]]; goalKind = "cube" }
         }
       }
-      if (OPT.farm && !goal && !mechThreatNear && hpFrac > 0.5 && !zoneUrgent) {
-        // hunt remembered drones, then crates
-        let bd = 220
+      if (OPT.farm && !goal && !mechs.some((o) => d2(o.pos, p) < 82) && hpFrac > 0.5 && !zoneUrgent) {
+        // only a drone or crate that is already nearby
+        let bd = 44
         for (const e of this.enemies.values()) {
           if (!e.npc || t - e.seen > 40) continue
           const dd = d2(e.pos, p)
           if (dd < bd && ptOk(e.pos)) { bd = dd; goal = [e.pos[0], e.pos[1]]; goalKind = "hunt" }
         }
         if (!goal) {
-          let bc = 170
+          let bc = 40
           for (const [, m] of this.crates) {
             const c = m.item
             if (Math.abs(c.pos[2] - (this.world?.ground(c.pos[0], c.pos[1]) ?? c.pos[2])) > 2) continue
@@ -1028,15 +1049,23 @@ export class Brain {
       }
     }
 
-    if (OPT.stealth && !zoneUrgent && !fightTarget && !recentlyHit && (this.mode === "hold" || this.mode === "loot" || this.mode === "cube")) {
-      const heard = this.threatBearings.some((b) => t - b.t < 8 && b.kind !== "damage")
-      const known = mechs.some((e) => d2(e.pos, p) < 170)
-      if (heard || known) {
-        const l = Math.hypot(moveDir[0], moveDir[1])
-        const cap = 4.4 / walk
-        if (l > cap) moveDir = [(moveDir[0] / l) * cap, (moveDir[1] / l) * cap]
-        boost = false
-      }
+    if (t >= this.kiteUntil && t < this.quietAfter && !zoneUrgent && this.mode !== "fight" && this.mode !== "retreat" && this.mode !== "kite") {
+      const l = Math.hypot(moveDir[0], moveDir[1])
+      const cap = 4.2 / walk
+      if (l > cap) moveDir = [(moveDir[0] / l) * cap, (moveDir[1] / l) * cap]
+      boost = false
+    }
+
+    const npcClose = npcs.some((e) => d2(e.pos, p) < 46)
+    const mechClose = mechs.some((e) => d2(e.pos, p) < 82)
+    const calmWalk = !zoneUrgent && !fightTarget && !recentlyHit && !npcClose && !mechClose
+      && (this.mode === "hold" || this.mode === "loot" || this.mode === "cube")
+    if (calmWalk) {
+      const step = this.cfg.sound?.step_speed ?? 5
+      const cap = Math.max(2.4, step - 0.7) / walk
+      const l = Math.hypot(moveDir[0], moveDir[1])
+      if (l > cap) moveDir = [(moveDir[0] / l) * cap, (moveDir[1] / l) * cap]
+      boost = false
     }
 
     // ---- dodge projectiles
@@ -1137,9 +1166,11 @@ export class Brain {
     {
       // keep an energy reserve for lightning and emergencies unless the zone is eating us
       const reserve = ltg ? 45 : 30
-      const emergency = outsideNow || this.mode === "retreat" || (fightTarget?.charging ?? false) || t < this.stuckUntil
+      const emergency = outsideNow || this.mode === "retreat" || this.mode === "kite" || (fightTarget?.charging ?? false) || t < this.stuckUntil
       if (boost && me.energy < reserve && !emergency) boost = false
     }
+    const leaving = this.mode === "kite" || this.mode === "retreat" || outsideNow || mortarDodge || !!dodge || t < this.stuckUntil
+    if (!leaving) boost = false
     act.boost = boost && Math.hypot(moveDir[0], moveDir[1]) > 0.3
 
     // ---- aim and fire
@@ -1251,7 +1282,7 @@ export class Brain {
       // shoot crates for loot when it is calm
       const calm = this.mode !== "rush" && this.mode !== "equip" && (OPT.farm || !OPT.stealth) && !mechThreatNear && t - this.lastDamageT > 6 && !zoneUrgent
       if (calm && ((gun && gunOk) || (ltg && me.energy > 40))) {
-        let best: { id: number; pos: number[]; hp: number } | null = null, bd = OPT.farm ? 90 : 70
+        let best: { id: number; pos: number[]; hp: number } | null = null, bd = 40
         for (const [, m] of this.crates) {
           if (m.seen < t) continue
           const dd = d2(m.item.pos, p)
