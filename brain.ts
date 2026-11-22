@@ -75,6 +75,7 @@ export class Brain {
   scanIdx = 0
   lastTargetId = -1
   lastTargetT = -100
+  hitAt = new Map<number, number>()
   lastKill: { pos: number[]; t: number } | null = null
   t = 0
 
@@ -190,7 +191,10 @@ export class Brain {
         if (ev.bearing != null) this.threatBearings.push({ t, bearing: ev.bearing, dist: "near", kind: "damage" })
       } else if (ev.type === "hit") {
         this.lastDealT = t
-        if (ev.target < 100) this.dealt.push({ t, a: ev.amount })
+        if (ev.target < 100) {
+          this.dealt.push({ t, a: ev.amount })
+          if (ev.target < 16) this.hitAt.set(ev.target, t)
+        }
       } else if (ev.type === "kill" && OPT.collectKill) {
         const enemy = this.enemies.get(ev.target)
         if (enemy) this.lastKill = { pos: enemy.pos, t }
@@ -583,7 +587,11 @@ export class Brain {
       }
       if (!engage) continue
       const recentDmg = this.taken.reduce((a, x) => a + (x.by === e.id && t - x.t < 3 ? x.a : 0), 0)
-      let s = dd + e.hp / 12 - recentDmg / 3 - (attacker ? 60 : 0) - (e.id === this.lastTargetId && t - this.lastTargetT < 3 ? 70 : 0) + (los ? 0 : 80)
+      const hitAge = t - (this.hitAt.get(e.id) ?? -1e9)
+      // A target we have already hit stays chosen, and the lock tightens as its HP falls.
+      const sticky = hitAge >= 0 && hitAge < 4.5 ? 125 + (1 - eFrac) * 240
+        : e.id === this.lastTargetId && t - this.lastTargetT < 1.6 ? 35 : 0
+      let s = dd + e.hp / 12 - recentDmg / 3 - (attacker ? 60 : 0) - sticky + (los ? 0 : 80)
       if (s < bestScore) { bestScore = s; target = e }
     }
     // NPC that is shooting us or that we can farm
