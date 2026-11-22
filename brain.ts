@@ -3,7 +3,7 @@ import type { ActorObs, BotAction, Hello, Observation, PickupObs, SelfObs, Weapo
 import { World } from "./world.ts"
 
 const env = (globalThis as any).process?.env ?? {}
-export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0" }
+export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0", finish: env.MF_FINISH === "1", recover: env.MF_RECOVER === "1" }
 const TAU = Math.PI * 2
 const wrap = (a: number) => {
   a = (a + Math.PI) % TAU
@@ -74,6 +74,9 @@ export class Brain {
   scanT = 0
   scanIdx = 0
   lastTargetId = -1
+  hitT = new Map<number, number>()
+  recoverSpot: number[] | null = null
+  recoverSpotT = -99
   lastTargetT = -100
   lastKill: { pos: number[]; t: number } | null = null
   t = 0
@@ -180,6 +183,7 @@ export class Brain {
       } else if (ev.type === "hit") {
         this.lastDealT = t
         if (ev.target < 100) this.dealt.push({ t, a: ev.amount })
+        if (ev.target < 100) this.hitT.set(ev.target, t)
       } else if (ev.type === "kill" && OPT.collectKill) {
         const enemy = this.enemies.get(ev.target)
         if (enemy) this.lastKill = { pos: enemy.pos, t }
@@ -570,9 +574,11 @@ export class Brain {
         const busy = e.hp < e.maxHp * 0.85
         engage = aware && dd < 200 || dd < 50 || (busy && hpFrac > 0.45 && dd < 160) || (eFrac < 0.4 && hpFrac > 0.35 && dd < 200)
       }
+      if (OPT.recover && !attacker && hpFrac < 0.8 && dd > 60 && !(eFrac < 0.3 && hpFrac > 0.5)) engage = false
+      if (OPT.finish && !engage && eFrac < 0.45 && hpFrac > 0.4 && dd < 220) engage = true
       if (!engage) continue
       const recentDmg = this.taken.reduce((a, x) => a + (x.by === e.id && t - x.t < 3 ? x.a : 0), 0)
-      let s = dd + e.hp / 12 - recentDmg / 3 - (attacker ? 60 : 0) - (e.id === this.lastTargetId && t - this.lastTargetT < 3 ? 70 : 0) + (los ? 0 : 80)
+      let s = dd + e.hp / 12 - recentDmg / 3 - (attacker ? 60 : 0) - (e.id === this.lastTargetId && t - this.lastTargetT < 3 ? 70 : 0) + (los ? 0 : 80) - (OPT.finish ? (1 - eFrac) * 120 : 0)
       if (s < bestScore) { bestScore = s; target = e }
     }
     // NPC that is shooting us or that we can farm
@@ -583,7 +589,7 @@ export class Brain {
       for (const e of npcs) {
         const dd = d2(e.pos, p)
         const attacker = this.attackers.has(e.id) && t - this.attackers.get(e.id)!.t < 4
-        const farm = (OPT.farm || !OPT.stealth) && !mechThreatNear && hpFrac > (OPT.farm ? 0.45 : 0.55) && dd < (OPT.farm ? 130 : 90) && (gunOk || ltg || laser || (gun && hpFrac > 0.7)) && !zoneUrgent
+        const farm = (OPT.farm || !OPT.stealth) && !(OPT.recover && hpFrac < 0.85) && !mechThreatNear && hpFrac > (OPT.farm ? 0.45 : 0.55) && dd < (OPT.farm ? 130 : 90) && (gunOk || ltg || laser || (gun && hpFrac > 0.7)) && !zoneUrgent
         if ((attacker || farm) && visibleNow.has(e.id) && hasLos(e) && dd < bd) { bd = dd; npcTarget = e }
       }
     }
@@ -663,6 +669,21 @@ export class Brain {
     }
     const fightTarget = target ?? npcTarget
     if (target) { this.lastTargetId = target.id; this.lastTargetT = t }
+    // Chase a wounded opponent that broke line of sight before it can regenerate.
+    let finishGoal: number[] | null = null
+    if (OPT.finish && !fightTarget && !zoneUrgent && hpFrac > 0.45) {
+      let bestF = Infinity
+      for (const e of mechs) {
+        if (visibleNow.has(e.id) || t - e.seen > 5 || t - (this.hitT.get(e.id) ?? -99) > 8) continue
+        const estHp = e.hp + Math.max(0, t - e.seen - 4) * 45
+        if (estHp / e.maxHp > 0.5 || estHp > me.hp) continue
+        const age = Math.min(t - e.seen, 1.5)
+        const q = [e.pos[0] + e.vel[0] * age, e.pos[1] + e.vel[1] * age, e.pos[2]]
+        if (d2(q, p) > 160 || !ptOk(q)) continue
+        if (mechs.some((o) => o.id !== e.id && d2(o.pos, q) < 90)) continue
+        if (estHp < bestF) { bestF = estHp; finishGoal = q }
+      }
+    }
 
     // ---- movement decision
     let moveDir: number[] = [0, 0]
@@ -741,6 +762,8 @@ export class Brain {
     if (retreatNow) this.retreatUntil = t + 2.5
     const retreat = t < this.retreatUntil && z.next_radius > 30 && !(target && target.hp / target.maxHp < 0.15 && hasLos(target))
 
+    // Regeneration needs a quiet interval: no damage dealt or taken.
+    const recovering = OPT.recover && !fightTarget && !zoneUrgent && hpFrac < 0.85 && !rushGoal && !equipGoal
     if (zoneUrgent && !(fightTarget && !outsideNow && tOut > needT * 1.2 + 3)) {
       this.mode = "zone"
       moveDir = this.navTo(obs, safePt, inCombat ? [] : avoid)
@@ -785,6 +808,19 @@ export class Brain {
       if (this.retreatSpot) moveDir = this.navTo(obs, this.retreatSpot)
       else moveDir = this.freeDir(p, [-Math.sin(b.bearing) * (this.strafeSign || 1), Math.cos(b.bearing) * (this.strafeSign || 1)])
       boost = me.energy > 40
+    } else if (recovering && !unseenHit && !retreat) {
+      this.mode = "recover"
+      if (!this.recoverSpot || t - this.recoverSpotT > 3 || !ptOk(this.recoverSpot)) {
+        this.recoverSpot = threatsPos.length ? this.findRetreat(p, threatsPos, safeC, Math.max(safeR + marginNext * 0.8, 20)) : this.findHoldSpot([p[0], p[1]], 25, safeC, Math.max(2, safeR), threatsPos)
+        this.recoverSpotT = t
+      }
+      const spot = this.recoverSpot
+      moveDir = spot && d2(spot, p) > 3 ? this.navTo(obs, spot, avoid) : [0, 0]
+      boost = false
+    } else if (finishGoal && !retreat) {
+      this.mode = "finish"
+      moveDir = this.navTo(obs, finishGoal, avoid)
+      boost = me.energy > 30
     } else if (fightTarget) {
       this.mode = target ? "fight" : "npc"
       const e = fightTarget
@@ -1176,7 +1212,7 @@ export class Brain {
     } else {
       if (!(laser && (laser.charge ?? 0) > 0)) this.laserHoldStart = -1
       // shoot crates for loot when it is calm
-      const calm = this.mode !== "rush" && this.mode !== "equip" && (OPT.farm || !OPT.stealth) && !mechThreatNear && t - this.lastDamageT > 6 && !zoneUrgent
+      const calm = this.mode !== "recover" && this.mode !== "rush" && this.mode !== "equip" && (OPT.farm || !OPT.stealth) && !mechThreatNear && t - this.lastDamageT > 6 && !zoneUrgent
       if (calm && ((gun && gunOk) || (ltg && me.energy > 40))) {
         let best: { id: number; pos: number[]; hp: number } | null = null, bd = OPT.farm ? 90 : 70
         for (const [, m] of this.crates) {
