@@ -26,7 +26,7 @@ A Mech Royale (`mechfight/1`) bot written in TypeScript and run with Bun. It pla
   - mortar uses a ballistic solution and lobs over cover;
   - keeps its torso on the attacker to avoid ×1.5 rear damage, and strafes randomly (left / right / stop) to beat lead aiming;
   - once a shot lands, that mech stays the target for a few seconds, and a weaker one is held harder than a healthy one;
-  - dodges charging lasers, incoming bullets, and mortar landings.
+  - dodges charging lasers, incoming bullets, and mortar landings. A bullet sidestep that would run toward a mech behind the torso is bent forward instead, because rear hits deal extra damage.
 - **Survival:** takes cover while reloading. Retreats out of line of sight when losing the damage trade, low on HP, or outnumbered. Turns toward and evades attackers it can't see.
 - **Upgrades:** armor > plating > gun damage > laser damage > nanites > the remaining upgrades.
 

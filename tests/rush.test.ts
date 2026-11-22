@@ -223,6 +223,18 @@ test("keeps a weakening target we have already hit", () => {
   assert.equal(b.lastTargetId, 4)
 })
 
+test("sidestep does not run at a mech behind the torso", () => usePredictiveDodge(() => {
+  const { b, o } = fixture()
+  step(o, 40)
+  o.self.aim = [0, 0]
+  o.self.vel = [0, 0, 0]
+  o.mechs = [{ id: 3, kind: "mech", pos: [0, -55, 0], vel: [0, 0, 0], aim: [0, 0], hp: 1400, max_hp: 1400, weapons: ["gun"], charging: false }]
+  o.projectiles = [{ id: 1, kind: "gun", pos: [40, 1, 4], vel: [-252, 0, 0] }]
+  const action = b.act(o)
+  assert.ok(action.move![0] > 0.25)
+  assert.ok(action.move![1] > -0.55)
+}))
+
 test("uses the most imminent shot when two shots call for opposite moves", () => usePredictiveDodge(() => {
   const { b, o } = fixture()
   o.mechs = []

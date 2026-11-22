@@ -1065,7 +1065,29 @@ export class Brain {
           const vl = Math.sqrt(vv)
           let nx = -vy / vl, ny = vx / vl
           if (nx * cx + ny * cy > 0) { nx = -nx; ny = -ny }
-          if (OPT.predictDodge) dodge = { time: tca, direction: [nx, ny] }
+          if (OPT.predictDodge) {
+            // Rear hits are 1.5x. A sidestep that runs at a mech behind the torso is worse than a wider step.
+            const face = fightTarget ? Math.atan2(fightTarget.pos[1] - p[1], fightTarget.pos[0] - p[0]) : me.aim[0]
+            const halfFront = ((this.cfg.mech?.front_arc_deg ?? 180) * Math.PI / 180) / 2
+            let backX = 0, backY = 0
+            for (const e of mechs) {
+              const od = d2(e.pos, p)
+              if (od > 150 || od < 1) continue
+              const bearing = Math.atan2(e.pos[1] - p[1], e.pos[0] - p[0])
+              if (Math.abs(angDiff(bearing, face)) < halfFront) continue
+              backX += (e.pos[0] - p[0]) / od
+              backY += (e.pos[1] - p[1]) / od
+            }
+            const intoBack = nx * backX + ny * backY
+            if (intoBack > 0.15) {
+              nx = nx - backX * intoBack + Math.cos(face) * 0.45
+              ny = ny - backY * intoBack + Math.sin(face) * 0.45
+              const nl = Math.hypot(nx, ny) || 1
+              nx /= nl
+              ny /= nl
+            }
+            dodge = { time: tca, direction: [nx, ny] }
+          }
           else {
             const dir = this.freeDir(p, [nx, ny])
             moveDir = [moveDir[0] * 0.3 + dir[0], moveDir[1] * 0.3 + dir[1]]
