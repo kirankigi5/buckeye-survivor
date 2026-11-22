@@ -76,6 +76,15 @@ test("low health cancels the opening objective", () => {
   b.act(o); assert.equal(b.spawnRushDone, true); assert.notEqual(b.mode, "rush")
 })
 
+test("refuses an open-ground weapon once the map is loaded", () => {
+  const { b, o, drone } = fixture()
+  b.world = { clearAt: () => 12, ground: () => 0, walkLine: () => true, isFree: () => true, los: () => true, segHit: () => -1 } as any
+  drone.pos = [90, 0, 0]
+  o.pickups = [{ id: 8000, kind: "laser", pos: [0, 50, 0] }]
+  b.act(o)
+  assert.notEqual(b.mode, "equip")
+})
+
 test("takes a short detour for a laser before committing to a distant drone", () => {
   const { b, o } = fixture()
   o.pickups = [{ id: 8000, kind: "laser", pos: [0, 40, 0] }]
