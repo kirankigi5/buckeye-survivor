@@ -3,7 +3,7 @@ import type { ActorObs, BotAction, Hello, Observation, PickupObs, SelfObs, Weapo
 import { World } from "./world.ts"
 
 const env = (globalThis as any).process?.env ?? {}
-export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0", finish: env.MF_FINISH === "1", recover: env.MF_RECOVER === "1", seek: env.MF_SEEK === "1", arc: env.MF_ARC === "1" }
+export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0", finish: env.MF_FINISH === "1", recover: env.MF_RECOVER === "1", seek: env.MF_SEEK === "1", arc: env.MF_ARC === "1", aimRange: env.MF_AIMRANGE === "1", plan: env.MF_PLAN === "1" }
 const TAU = Math.PI * 2
 const wrap = (a: number) => {
   a = (a + Math.PI) % TAU
@@ -81,6 +81,7 @@ export class Brain {
   seekT = -99
   laserFiredT = new Map<number, number>()
   obsT = 0
+  planDir: number[] = [0, 0]
   lastTargetT = -100
   lastKill: { pos: number[]; t: number } | null = null
   t = 0
@@ -154,6 +155,84 @@ export class Brain {
     if (d2(p, z.next_center) > z.next_radius - 2) return z.shrink_end - obs.t
     // next phase: assume it starts shrinking after a hold and might move anywhere in the circle
     return Infinity
+  }
+
+  /**
+   * Sample move directions, roll each forward ~0.6 s with the ground
+   * acceleration, and score incoming projectiles, exposure to shooters
+   * (rear-arc ones weigh more), lightning reach, range to the target,
+   * line of sight for our own shots, walls and the safe circle.
+   */
+  planMove(obs: Observation, intent: number[], target: Enemy, mechs: Enemy[], pref: number, wantCover: boolean, haveLtg: boolean, safeC: number[], safeR: number): { dir: number[]; boost: boolean } | null {
+    const w = this.world
+    if (!w) return null
+    const me = obs.self, p = me.pos, t = obs.t
+    const sc = this.scale(me.cubes)
+    const st = me.stats ?? {}
+    const walk = st.walk_speed ?? 11.7, run = st.boost_speed ?? 19.5, acc = st.ground_accel ?? 58.5
+    const rad = 2.5 * sc + 0.5, height = 9 * sc
+    const lr = this.cfg.weapons.lightning?.range ?? 45
+    const shooters = mechs.filter((o) => t - o.seen < 1.5 && d2(o.pos, p) < 200).sort((a, b) => d2(a.pos, p) - d2(b.pos, p)).slice(0, 4)
+    const toT = Math.atan2(target.pos[1] - p[1], target.pos[0] - p[0])
+    const il = Math.hypot(intent[0], intent[1])
+    const incoming = obs.projectiles.filter((pr) => false && pr.kind === "gun" && ((p[0] - pr.pos[0]) * pr.vel[0] + (p[1] - pr.pos[1]) * pr.vel[1]) > 0)
+    const cands: { dir: number[]; boost: boolean }[] = [{ dir: [0, 0], boost: false }]
+    for (let k = 0; k < 16; k++) {
+      const a = (k / 16) * Math.PI * 2
+      cands.push({ dir: [Math.cos(a), Math.sin(a)], boost: false })
+      if (me.energy > 35 && k % 2 === 0) cands.push({ dir: [Math.cos(a), Math.sin(a)], boost: true })
+    }
+    if (il > 0.1) cands.push({ dir: [intent[0] / il, intent[1] / il], boost: false })
+    let best: { dir: number[]; boost: boolean } | null = null, bestS = -Infinity
+    for (const c of cands) {
+      const spd = c.boost ? run : walk
+      let x = p[0], y = p[1], vx = me.vel[0], vy = me.vel[1]
+      let score = 0, blocked = false
+      const hitIds = new Set<number>()
+      for (let k = 1; k <= 12; k++) {
+        const dt = 0.05, T = k * dt
+        const tx = c.dir[0] * spd - vx, ty = c.dir[1] * spd - vy, tl = Math.hypot(tx, ty)
+        const dv = Math.min(tl, acc * dt)
+        if (tl > 1e-6) { vx += (tx / tl) * dv; vy += (ty / tl) * dv }
+        x += vx * dt; y += vy * dt
+        if ((k === 4 || k === 12) && !w.isFree(x, y, 2.4)) { blocked = true; break }
+        for (const pr of incoming) {
+          if (hitIds.has(pr.id)) continue
+          const px = pr.pos[0] + pr.vel[0] * T, py = pr.pos[1] + pr.vel[1] * T, pz = pr.pos[2] + pr.vel[2] * T
+          if (Math.hypot(px - x, py - y) < rad && pz > p[2] - 0.5 && pz < p[2] + height + 0.5) {
+            hitIds.add(pr.id)
+            const from = Math.atan2(pr.pos[1] - y, pr.pos[0] - x)
+            score -= Math.abs(angDiff(from, toT)) > Math.PI / 2 ? 75 : 50
+          }
+        }
+      }
+      if (blocked) continue
+      const q = [x, y, w.ground(x, y)]
+      const chest = [x, y, q[2] + 5 * sc]
+      for (const o of shooters) {
+        const om = [o.pos[0], o.pos[1], o.pos[2] + 7 * this.scale(o.cubes)]
+        const od = Math.hypot(o.pos[0] - x, o.pos[1] - y)
+        const sees = this.los(om, chest)
+        if (o.id === target.id) {
+          if (sees) { if (wantCover) score -= 25 }
+          else if (!wantCover) score -= 30
+          score -= Math.abs(od - pref) * 0.35
+        } else if (sees) {
+          const rear = Math.abs(angDiff(Math.atan2(o.pos[1] - y, o.pos[0] - x), toT)) > Math.PI / 2
+          score -= rear ? 38 : 22
+        }
+        if (o.weapons.includes("lightning") && !(haveLtg && o.id === target.id) && od < lr + 10) score -= (lr + 10 - od) * 3
+      }
+      const out = d2(q, safeC) - safeR
+      if (out > 0) score -= out * 2
+      if (il > 0.1) score += 50 * (c.dir[0] * intent[0] + c.dir[1] * intent[1]) / il
+      score += 6 * (c.dir[0] * this.planDir[0] + c.dir[1] * this.planDir[1])
+      score += 8 * Math.abs(c.dir[0] * Math.sin(toT) - c.dir[1] * Math.cos(toT))
+      if (c.boost) score -= 4
+      if (score > bestS) { bestS = score; best = c }
+    }
+    if (best) this.planDir = best.dir
+    return best
   }
 
   // Extra damage we deal: rear hits (x rear_mult) and laser cook-off on mortar carriers.
@@ -888,6 +967,7 @@ export class Brain {
       if (ltg && !eHasLtg) pref = 25
       else if (ltg && eHasLtg) pref = laser ? 70 : 28
       else if (eHasLtg) pref = 75
+      else if (OPT.aimRange && !laser) pref = 55
       if (e.npc) pref = ltg ? 30 : 50
       let radial = 0
       if (dd > pref + 15) radial = hpFrac > 0.45 ? 0.7 : 0
@@ -1106,6 +1186,18 @@ export class Brain {
       }
     }
 
+    // ---- short-horizon movement planner for fights
+    let planned = false
+    if (OPT.plan && target && this.mode === "fight" && !zoneUrgent && this.left() > 2.5) {
+      const dd = d2(target.pos, p)
+      const lr = this.cfg.weapons.lightning?.range ?? 45
+      const eLtg = target.weapons.includes("lightning")
+      const pref = ltg && !eLtg ? 25 : eLtg ? lr + 15 : laser ? 85 : 60
+      const ready = gunOk || (!!laser && laser.cooldown < 0.7) || (!!ltg && dd < lr && me.energy > 8)
+      const r = this.planMove(obs, moveDir, target, mechs, pref, !ready, !!ltg, safeC, safeR)
+      if (r) { moveDir = r.dir; boost = r.boost; planned = true }
+    }
+
     // ---- dodge projectiles
     let dodge: { time: number; direction: number[] } | null = null
     let mortarDodge = false
@@ -1246,7 +1338,8 @@ export class Brain {
         }
       }
       // fire whatever is lined up
-      if (gun && gunOk && los && dd < (gun.stats.range ?? 230)) {
+      const gunMax = OPT.aimRange && !e.npc && e.hp > e.maxHp * 0.2 ? 150 : (gun?.stats.range ?? 230)
+      if (gun && gunOk && los && dd < Math.min(gunMax, gun.stats.range ?? 230)) {
         const lp = this.leadPoint(muzzle, e, gunSpeed, 0.05)
         if (gun.cooldown <= 0.1 && this.onTarget(me, muzzle, lp, hw, hh)) {
           const hit = this.world ? this.world.segHit(muzzle, lp) : -1
