@@ -3,7 +3,7 @@ import type { ActorObs, BotAction, Hello, Observation, PickupObs, SelfObs, Weapo
 import { World } from "./world.ts"
 
 const env = (globalThis as any).process?.env ?? {}
-export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0", finish: env.MF_FINISH === "1", recover: env.MF_RECOVER === "1" }
+export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0", finish: env.MF_FINISH === "1", recover: env.MF_RECOVER === "1", seek: env.MF_SEEK === "1" }
 const TAU = Math.PI * 2
 const wrap = (a: number) => {
   a = (a + Math.PI) % TAU
@@ -77,6 +77,8 @@ export class Brain {
   hitT = new Map<number, number>()
   recoverSpot: number[] | null = null
   recoverSpotT = -99
+  seekGoal: number[] | null = null
+  seekT = -99
   lastTargetT = -100
   lastKill: { pos: number[]; t: number } | null = null
   t = 0
@@ -762,6 +764,30 @@ export class Brain {
     if (retreatNow) this.retreatUntil = t + 2.5
     const retreat = t < this.retreatUntil && z.next_radius > 30 && !(target && target.hp / target.maxHp < 0.15 && hasLos(target))
 
+    // Go find house bots while healthy: kills before the late swarm are the points.
+    let seekGoal: number[] | null = null
+    if (OPT.seek && !fightTarget && !zoneUrgent && hpFrac > 0.75 && (gunOk || laser || ltg) && !rushGoal && !equipGoal && t > 8) {
+      if (this.seekGoal && t - this.seekT < 4 && d2(this.seekGoal, p) > 10 && ptOk(this.seekGoal)) seekGoal = this.seekGoal
+      else {
+        let bestS = 250
+        for (const e of this.enemies.values()) {
+          if (e.npc || t - e.seen > 20) continue
+          const dd = d2(e.pos, p)
+          if (dd < bestS && dd > 10 && ptOk(e.pos)) { bestS = dd; seekGoal = [e.pos[0], e.pos[1], e.pos[2]] }
+        }
+        if (!seekGoal) {
+          const snd = this.threatBearings.filter((b) => t - b.t < 4 && (b.kind === "gun" || b.kind === "laser" || b.kind === "lightning" || b.kind === "mortar")).sort((a, b) => b.t - a.t)[0]
+          if (snd) {
+            const near = this.cfg.sound?.near ?? 60, mid = this.cfg.sound?.mid ?? 150
+            const r = snd.dist === "near" ? near * 0.7 : snd.dist === "mid" ? (near + mid) * 0.5 : mid * 1.1
+            const q = [p[0] + Math.cos(snd.bearing) * r, p[1] + Math.sin(snd.bearing) * r, p[2]]
+            if (ptOk(q)) seekGoal = q
+          }
+        }
+        this.seekGoal = seekGoal
+        this.seekT = t
+      }
+    }
     // Regeneration needs a quiet interval: no damage dealt or taken.
     const recovering = OPT.recover && !fightTarget && !zoneUrgent && hpFrac < 0.85 && !rushGoal && !equipGoal
     if (zoneUrgent && !(fightTarget && !outsideNow && tOut > needT * 1.2 + 3)) {
@@ -808,6 +834,10 @@ export class Brain {
       if (this.retreatSpot) moveDir = this.navTo(obs, this.retreatSpot)
       else moveDir = this.freeDir(p, [-Math.sin(b.bearing) * (this.strafeSign || 1), Math.cos(b.bearing) * (this.strafeSign || 1)])
       boost = me.energy > 40
+    } else if (seekGoal && !retreat && !unseenHit) {
+      this.mode = "seek"
+      moveDir = this.navTo(obs, seekGoal)
+      boost = me.energy > 60 && d2(seekGoal, p) > 60
     } else if (recovering && !unseenHit && !retreat) {
       this.mode = "recover"
       if (!this.recoverSpot || t - this.recoverSpotT > 3 || !ptOk(this.recoverSpot)) {
