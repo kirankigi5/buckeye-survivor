@@ -1,0 +1,859 @@
+/** Decision making: zone, navigation, looting, combat. */
+import type { ActorObs, BotAction, Hello, Observation, PickupObs, SelfObs, WeaponObs } from "./mechfight.ts"
+import { World } from "./world.ts"
+
+const TAU = Math.PI * 2
+const wrap = (a: number) => {
+  a = (a + Math.PI) % TAU
+  if (a < 0) a += TAU
+  return a - Math.PI
+}
+const angDiff = (a: number, b: number) => wrap(a - b)
+const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v))
+const d2 = (a: number[], b: number[]) => Math.hypot(a[0] - b[0], a[1] - b[1])
+
+type Enemy = { id: number; pos: number[]; vel: number[]; aim: number[]; hp: number; maxHp: number; cubes: number; weapons: string[]; charging: boolean; seen: number; npc: boolean }
+type Mem<T> = { item: T; seen: number }
+
+const UPGRADE_PRIORITY = [
+  "armor", "plating", "nanites", "laser_damage", "laser_charge", "lightning_efficiency", "lightning_range",
+  "gun_rate", "gun_damage", "gyros", "lightning_chain", "servos", "gun_mag", "gun_velocity", "capacitor",
+  "reactor", "jets", "mortar_reload", "mortar_velocity", "mortar_splash", "sensors", "laser_pierce",
+]
+const WEAPON_VALUE: Record<string, number> = { laser: 3, lightning: 3, mortar: 1, gun: 0 }
+
+export class Brain {
+  cfg: any
+  world: World | null = null
+  rng: () => number
+  slot: number
+
+  enemies = new Map<number, Enemy>()
+  pickups = new Map<number, Mem<PickupObs>>()
+  cubes = new Map<number, Mem<{ id: number; pos: number[] }>>()
+  crates = new Map<number, Mem<{ id: number; pos: number[]; hp: number }>>()
+  badPickups = new Map<number, number>() // id -> until t
+  attackers = new Map<number, { t: number; bearing: number; weapon: string }>()
+  threatBearings: { t: number; bearing: number; dist: string; kind: string }[] = []
+  lastDamageT = -100
+  taken: { t: number; a: number }[] = []
+  dealt: { t: number; a: number }[] = []
+  lastDealT = -100
+  zoneStart = new Map<number, { c: number[]; r: number }>()
+
+  // navigation
+  path: [number, number][] | null = null
+  pathGoal: number[] | null = null
+  pathT = -100
+  stuckRef: { t: number; p: number[] } = { t: 0, p: [0, 0] }
+  stuckUntil = -1
+  unstickDir = 0
+
+  // combat
+  strafeSign = 1
+  strafeFlipT = 0
+  laserHoldStart = -1
+  retreatUntil = -1
+  retreatSpot: number[] | null = null
+  retreatSpotT = -100
+  retreatHp = 0.6
+  mode = "init"
+  holdSpot: number[] | null = null
+  holdKey = ""
+  scanT = 0
+  scanIdx = 0
+  lastTargetId = -1
+  lastTargetT = -100
+  t = 0
+
+  constructor(hello: Hello) {
+    this.cfg = hello.config
+    this.slot = hello.slot
+    let s = (hello.seed >>> 0) || 12345
+    this.rng = () => {
+      s ^= s << 13; s >>>= 0
+      s ^= s >>> 17
+      s ^= s << 5; s >>>= 0
+      return s / 4294967296
+    }
+    const here = new URL(".", import.meta.url).pathname
+    for (const dir of [hello.map?.dir, "/arena", here + "arena", "arena"]) {
+      if (!dir) continue
+      try {
+        this.world = new World(dir)
+        break
+      } catch (e) {
+        console.error(`world load failed from ${dir}: ${(e as Error).message}`)
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- helpers
+  weapon(me: SelfObs, kind: string): [WeaponObs | null, number] {
+    for (let i = 0; i < me.weapons.length; i++) {
+      const w = me.weapons[i]
+      if (w && w.kind === kind) return [w, i]
+    }
+    return [null, -1]
+  }
+  scale(cubes: number) {
+    return 1 + (this.cfg.cubes.size_per_cube ?? 0.05) * (cubes || 0)
+  }
+  los(a: number[], b: number[]) {
+    return this.world ? this.world.los(a, b) : true
+  }
+
+  /** Zone circle at time tt (interpolating during shrink). */
+  zoneAt(obs: Observation, tt: number): { c: number[]; r: number } {
+    const z = obs.zone
+    let st = this.zoneStart.get(z.shrink_start)
+    if (!st) {
+      st = { c: [z.center[0], z.center[1]], r: z.radius }
+      if (obs.t <= z.shrink_start + 0.05) this.zoneStart.set(z.shrink_start, st)
+      else {
+        // first seen mid-shrink: back out the start circle assuming `center/radius` are live
+        const f = clamp((obs.t - z.shrink_start) / Math.max(1e-6, z.shrink_end - z.shrink_start), 0, 0.999)
+        const r0 = (z.radius - f * z.next_radius) / (1 - f)
+        const c0 = [0, 1].map((i) => (z.center[i] - f * z.next_center[i]) / (1 - f))
+        st = { c: c0, r: r0 }
+        this.zoneStart.set(z.shrink_start, st)
+      }
+    }
+    if (tt <= z.shrink_start) return st
+    const f = clamp((tt - z.shrink_start) / Math.max(1e-6, z.shrink_end - z.shrink_start), 0, 1)
+    return { c: [st.c[0] + (z.next_center[0] - st.c[0]) * f, st.c[1] + (z.next_center[1] - st.c[1]) * f], r: st.r + (z.next_radius - st.r) * f }
+  }
+
+  /** Seconds until point p is outside the zone (Infinity if never during this phase). */
+  timeUntilOut(obs: Observation, p: number[]): number {
+    const z = obs.zone
+    for (let tt = obs.t; tt <= z.shrink_end + 0.01; tt += 1) {
+      const c = this.zoneAt(obs, tt)
+      if (d2(p, c.c) > c.r - 2) return tt - obs.t
+    }
+    if (d2(p, z.next_center) > z.next_radius - 2) return z.shrink_end - obs.t
+    // next phase: assume it starts shrinking after a hold and might move anywhere in the circle
+    return Infinity
+  }
+
+  // ---------------------------------------------------------------- memory
+  observe(obs: Observation) {
+    const t = obs.t
+    const me = obs.self
+    for (const m of obs.mechs) {
+      const e: Enemy = {
+        id: m.id, pos: m.pos, vel: m.vel, aim: m.aim, hp: m.hp ?? 1400, maxHp: m.max_hp ?? 1400, cubes: m.cubes ?? 0,
+        weapons: m.weapons ?? [], charging: !!m.charging, seen: t, npc: m.kind === "npc",
+      }
+      this.enemies.set(m.id, e)
+    }
+    for (const [id, e] of this.enemies) if (t - e.seen > 12) this.enemies.delete(id)
+    for (const p of obs.pickups) this.pickups.set(p.id, { item: p, seen: t })
+    for (const c of obs.cubes) this.cubes.set(c.id, { item: c, seen: t })
+    for (const c of obs.crates) this.crates.set(c.id, { item: { id: c.id, pos: c.pos, hp: c.hp ?? 300 }, seen: t })
+    // forget items we should be seeing but aren't
+    const pos = me.pos
+    for (const map of [this.pickups, this.cubes, this.crates] as Map<number, Mem<any>>[]) {
+      for (const [id, m] of map) {
+        const dd = d2(m.item.pos, pos)
+        if (m.seen < t && (dd < 25 || t - m.seen > 90)) map.delete(id)
+      }
+    }
+    for (const ev of obs.events) {
+      if (ev.type === "damaged") {
+        if (ev.weapon !== "zone") { this.lastDamageT = t; this.taken.push({ t, a: ev.amount }) }
+        if (ev.by != null && ev.bearing != null) this.attackers.set(ev.by, { t, bearing: ev.bearing, weapon: ev.weapon })
+        if (ev.bearing != null) this.threatBearings.push({ t, bearing: ev.bearing, dist: "near", kind: "damage" })
+      } else if (ev.type === "hit") {
+        this.lastDealT = t
+        if (ev.target < 100) this.dealt.push({ t, a: ev.amount })
+      } else if (ev.type === "take_failed") {
+        this.badPickups.set(ev.id, t + (ev.reason === "range" ? 1 : 30))
+        if (ev.reason === "gone") this.pickups.delete(ev.id)
+      } else if (ev.type === "took") {
+        this.pickups.delete(ev.id)
+      } else if (ev.type === "dropped") {
+        this.badPickups.set(ev.id, t + 1e9) // don't pick back up what we dropped
+      }
+    }
+    for (const s of obs.sounds) {
+      if (["gun", "laser", "laser_charge", "lightning", "mortar", "step", "boost", "jet", "reload"].includes(s.kind) && s.dist !== "far")
+        this.threatBearings.push({ t: t - s.age, bearing: s.bearing, dist: s.dist, kind: s.kind })
+    }
+    this.taken = this.taken.filter((x) => t - x.t < 6)
+    this.dealt = this.dealt.filter((x) => t - x.t < 6)
+    this.threatBearings = this.threatBearings.filter((b) => t - b.t < 6).slice(-30)
+    for (const [id, a] of this.attackers) if (t - a.t > 8) this.attackers.delete(id)
+  }
+
+  // ---------------------------------------------------------------- navigation
+  /** Returns a unit move vector toward goal using A* waypoints. */
+  navTo(obs: Observation, goal: number[], avoid: { x: number; y: number; r: number; w: number }[] = []): number[] {
+    const me = obs.self
+    const p = me.pos
+    const w = this.world
+    if (!w) {
+      const dx = goal[0] - p[0], dy = goal[1] - p[1], L = Math.hypot(dx, dy) || 1
+      return [dx / L, dy / L]
+    }
+    const t = obs.t
+    const goalMoved = !this.pathGoal || d2(this.pathGoal, goal) > Math.max(4, 0.1 * d2(p, goal))
+    if (!this.path || goalMoved || t - this.pathT > 2.5 || this.path.length === 0) {
+      if (d2(p, goal) < 3 || w.walkLine(p[0], p[1], goal[0], goal[1], 2.6)) this.path = [[goal[0], goal[1]]]
+      else this.path = w.path(p[0], p[1], goal[0], goal[1], Math.max(1.5, Math.min(7, this.left() - 3)), avoid)
+      this.pathGoal = goal
+      this.pathT = t
+    }
+    const path = this.path
+    if (!path || path.length === 0) {
+      const dx = goal[0] - p[0], dy = goal[1] - p[1], L = Math.hypot(dx, dy) || 1
+      return [dx / L, dy / L]
+    }
+    // advance waypoints
+    while (path.length > 1 && (d2(p, path[0]) < 3 || w.walkLine(p[0], p[1], path[1][0], path[1][1], 2.6) && d2(p, path[0]) < 12)) path.shift()
+    const wp = path[0]
+    let dx = wp[0] - p[0], dy = wp[1] - p[1]
+    const L = Math.hypot(dx, dy)
+    if (L < 0.5) return [0, 0]
+    dx /= L; dy /= L
+    return this.steer(p, [dx, dy])
+  }
+
+  /** Push away from nearby walls. */
+  steer(p: number[], dir: number[]): number[] {
+    const w = this.world
+    if (!w) return dir
+    const c = w.clearAt(p[0], p[1])
+    if (c >= 4) return dir
+    const e = 2
+    const gx = w.clearAt(p[0] + e, p[1]) - w.clearAt(p[0] - e, p[1])
+    const gy = w.clearAt(p[0], p[1] + e) - w.clearAt(p[0], p[1] - e)
+    const gl = Math.hypot(gx, gy)
+    if (gl < 1e-6) return dir
+    const k = (4 - c) / 4 * 0.6
+    let x = dir[0] + (gx / gl) * k, y = dir[1] + (gy / gl) * k
+    const l = Math.hypot(x, y) || 1
+    return [x / l, y / l]
+  }
+
+  /** Pick the free direction closest to `dir` (for combat movement without a path). */
+  freeDir(p: number[], dir: number[], look = 5): number[] {
+    const w = this.world
+    const L = Math.hypot(dir[0], dir[1])
+    if (!w || L < 1e-6) return dir
+    const base = Math.atan2(dir[1], dir[0])
+    for (const off of [0, 0.4, -0.4, 0.8, -0.8, 1.2, -1.2, 1.6, -1.6, 2.2, -2.2, Math.PI]) {
+      const a = base + off
+      const x = p[0] + Math.cos(a) * look, y = p[1] + Math.sin(a) * look
+      if (w.isFree(x, y, 2.6) && w.isFree(p[0] + Math.cos(a) * look * 0.5, p[1] + Math.sin(a) * look * 0.5, 2.6)) {
+        if (Math.abs(off) > 1.5) this.strafeSign = -this.strafeSign
+        return [Math.cos(a) * L, Math.sin(a) * L]
+      }
+    }
+    return dir
+  }
+
+  /** Find a cover spot near `center` (within `rad`) inside the safe disk. */
+  findHoldSpot(center: number[], rad: number, safeC: number[], safeR: number, threats: number[][]): number[] {
+    const w = this.world
+    if (!w) return center
+    let best = center, bestS = -Infinity
+    const t0 = performance.now()
+    const z0 = 8
+    for (let i = 0; i < 40; i++) {
+      if (performance.now() - t0 > 6 || this.left() < 4) break
+      const a = this.rng() * TAU, r = Math.sqrt(this.rng()) * rad
+      const x = center[0] + Math.cos(a) * r, y = center[1] + Math.sin(a) * r
+      if (!w.isFree(x, y, 3.2)) continue
+      if (Math.hypot(x - safeC[0], y - safeC[1]) > safeR) continue
+      const g = w.ground(x, y)
+      let cover = 0
+      for (let k = 0; k < 12; k++) {
+        const b = (k / 12) * TAU
+        if (w.segHit([x, y, g + z0], [x + Math.cos(b) * 25, y + Math.sin(b) * 25, g + z0], false) >= 0) cover++
+      }
+      let s = Math.min(cover, 7) - r / 25
+      for (const th of threats) if (w.los([x, y, g + z0], [th[0], th[1], th[2] + 6])) s -= 3
+      if (s > bestS) { bestS = s; best = [x, y] }
+    }
+    return best
+  }
+
+  /** A spot that breaks line of sight from threats. */
+  findRetreat(p: number[], threats: number[][], safeC: number[], safeR: number): number[] | null {
+    const w = this.world
+    if (!w) return null
+    let best: number[] | null = null, bestS = -Infinity
+    const t0 = performance.now()
+    for (let i = 0; i < 36; i++) {
+      if (performance.now() - t0 > 5 || this.left() < 4) break
+      const a = (i / 36) * TAU + this.rng() * 0.2
+      const r = 18 + this.rng() * 40
+      const x = p[0] + Math.cos(a) * r, y = p[1] + Math.sin(a) * r
+      if (!w.isFree(x, y, 3)) continue
+      if (Math.hypot(x - safeC[0], y - safeC[1]) > safeR) continue
+      const g = w.ground(x, y)
+      let s = -r / 15
+      let seen = 0
+      for (const th of threats) {
+        if (w.los([x, y, g + 6], [th[0], th[1], th[2] + 7])) seen++
+        s += Math.min(60, Math.hypot(x - th[0], y - th[1])) / 20
+        // don't run past the threat
+        const tx = th[0] - p[0], ty = th[1] - p[1]
+        if ((tx * (x - p[0]) + ty * (y - p[1])) > 0) s -= 4
+      }
+      s -= seen * 6
+      if (s > bestS) { bestS = s; best = [x, y] }
+    }
+    return best
+  }
+
+  // ---------------------------------------------------------------- aiming
+  /** Lead-aim point for a projectile of speed v from muzzle m at enemy e. */
+  leadPoint(m: number[], e: Enemy, v: number, tlag = 0): number[] {
+    const sc = this.scale(e.cubes)
+    const cz = e.npc ? 1.75 : 4.5 * sc
+    const g = this.cfg.mech.gravity ?? 22
+    let tt = 0
+    let pt = [e.pos[0], e.pos[1], e.pos[2] + cz]
+    const age = Math.max(0, this.t - e.seen)
+    for (let i = 0; i < 3; i++) {
+      const T = tt + tlag + age
+      let z = e.pos[2] + e.vel[2] * T
+      if (Math.abs(e.vel[2]) > 0.5) z -= 0.5 * g * T * T * 0.5
+      const gr = this.world ? this.world.ground(e.pos[0] + e.vel[0] * T, e.pos[1] + e.vel[1] * T) : -1e9
+      z = Math.max(z, gr)
+      pt = [e.pos[0] + e.vel[0] * T, e.pos[1] + e.vel[1] * T, z + cz]
+      tt = Math.hypot(pt[0] - m[0], pt[1] - m[1], pt[2] - m[2]) / v
+    }
+    return pt
+  }
+
+  aimAt(m: number[], pt: number[]): [number, number] {
+    const dx = pt[0] - m[0], dy = pt[1] - m[1], dz = pt[2] - m[2]
+    return [Math.atan2(dy, dx), Math.atan2(dz, Math.hypot(dx, dy))]
+  }
+
+  /** Is the actual aim close enough to hit a target of half-width hw and half-height hh at point pt? */
+  onTarget(me: SelfObs, m: number[], pt: number[], hw: number, hh: number): boolean {
+    const [yaw, pitch] = me.aim
+    const want = this.aimAt(m, pt)
+    const D = Math.hypot(pt[0] - m[0], pt[1] - m[1], pt[2] - m[2])
+    const ey = Math.abs(angDiff(yaw, want[0])) * D
+    const ep = Math.abs(pitch - want[1]) * D
+    return ey < hw && ep < hh
+  }
+
+  /** Mortar pitch to hit pt from m. Returns [low, high] (null if out of range). */
+  mortarPitch(m: number[], pt: number[], v: number, g: number): [number, number] | null {
+    const D = Math.hypot(pt[0] - m[0], pt[1] - m[1])
+    const dz = pt[2] - m[2]
+    const v2 = v * v
+    const disc = v2 * v2 - g * (g * D * D + 2 * dz * v2)
+    if (disc < 0) return null
+    const sq = Math.sqrt(disc)
+    return [Math.atan((v2 - sq) / (g * D)), Math.atan((v2 + sq) / (g * D))]
+  }
+
+  // ---------------------------------------------------------------- main
+  tickStart = 0
+  /** ms left of this decision's compute budget */
+  left(total = 14) {
+    return total - (performance.now() - this.tickStart)
+  }
+
+  act(obs: Observation): BotAction {
+    this.tickStart = performance.now()
+    this.t = obs.t
+    this.observe(obs)
+    const me = obs.self
+    const t = obs.t
+    const p = me.pos
+    const st = me.stats
+    const sc = this.scale(me.cubes)
+    const eye = [p[0], p[1], p[2] + (st.eye_height ?? 8 * sc)]
+    const muzzle = [p[0], p[1], p[2] + (st.muzzle_height ?? 7 * sc)]
+    const hpFrac = me.hp / me.max_hp
+    const act: BotAction = { move: [0, 0], boost: false, jump: false, fire: [false, false] }
+    const labels: string[] = []
+
+    // ---- upgrades
+    if (obs.offer && obs.offer.choices.length) {
+      let bi = 0, bs = Infinity
+      obs.offer.choices.forEach((c, i) => {
+        const r = UPGRADE_PRIORITY.indexOf(c.id)
+        const s = r < 0 ? 100 : r
+        if (s < bs) { bs = s; bi = i }
+      })
+      act.pick = bi
+    }
+
+    // ---- zone
+    const z = obs.zone
+    const curZ = this.zoneAt(obs, t)
+    const marginNext = clamp(z.next_radius * 0.22, 3, 45)
+    const safeC = z.next_center
+    const safeR = Math.max(0, z.next_radius - marginNext)
+    const distOutSafe = Math.max(0, d2(p, safeC) - safeR)
+    const tOut = this.timeUntilOut(obs, p)
+    const walk = st.walk_speed ?? 11.7
+    const needT = distOutSafe / walk
+    const outsideNow = d2(p, curZ.c) > curZ.r - 1 || !me.in_zone
+    const zoneUrgent = outsideNow || (tOut < Infinity && needT * 1.4 + 6 > tOut)
+    // point to go to if we need to move inward
+    let safePt: number[]
+    {
+      const dx = p[0] - safeC[0], dy = p[1] - safeC[1], L = Math.hypot(dx, dy)
+      const r = Math.max(0, safeR * 0.85)
+      safePt = L <= r ? [p[0], p[1]] : [safeC[0] + (dx / L) * r, safeC[1] + (dy / L) * r]
+    }
+    // is a point safe to go to (inside the region we must be in soon)
+    const ptOk = (q: number[], slack = 0) => {
+      if (d2(q, curZ.c) > curZ.r - 5) return false
+      const travel = d2(p, q) / walk + Math.max(0, d2(q, safeC) - safeR) / walk
+      const tq = this.timeUntilOut(obs, q)
+      return travel * 1.3 + 5 + slack < Math.min(tOut === Infinity ? 1e9 : tOut + 30, tq) || d2(q, safeC) < safeR
+    }
+
+    // ---- threats
+    const mechs = [...this.enemies.values()].filter((e) => !e.npc && t - e.seen < 6)
+    const npcs = [...this.enemies.values()].filter((e) => e.npc && t - e.seen < 3)
+    const visibleNow = new Set(obs.mechs.map((m) => m.id))
+    const canSee = (e: Enemy) => {
+      const sce = e.npc ? 0.5 : this.scale(e.cubes)
+      return this.los(eye, [e.pos[0], e.pos[1], e.pos[2] + 4.5 * sce]) || this.los(eye, [e.pos[0], e.pos[1], e.pos[2] + 8 * sce])
+    }
+    const losCache = new Map<number, boolean>()
+    const hasLos = (e: Enemy) => {
+      let v = losCache.get(e.id)
+      if (v === undefined) { v = canSee(e); losCache.set(e.id, v) }
+      return v
+    }
+    const [gun, gunSlot] = this.weapon(me, "gun")
+    const [laser, laserSlot] = this.weapon(me, "laser")
+    const [ltg, ltgSlot] = this.weapon(me, "lightning")
+    const [mortar, mortarSlot] = this.weapon(me, "mortar")
+    const gunOk = !!gun && (gun.ammo ?? 1) > 0 && !(gun.reload > 0)
+
+    // ---- choose a target
+    const recentlyHit = t - this.lastDamageT < 4
+    let target: Enemy | null = null
+    let bestScore = Infinity
+    for (const e of mechs) {
+      const dd = d2(e.pos, p)
+      if (dd > 260) continue
+      const los = visibleNow.has(e.id) && hasLos(e)
+      const attacker = this.attackers.has(e.id) && t - this.attackers.get(e.id)!.t < 5
+      if (!los && !attacker) continue
+      const eFrac = e.hp / e.maxHp
+      let engage = attacker || dd < 70 || (hpFrac > 0.5 && (dd < 130 || (laser && dd < 240)))
+      if (hpFrac > 0.4 && eFrac < 0.35 && dd < 200) engage = true
+      if (!engage) continue
+      let s = dd + e.hp / 12 - (attacker ? 60 : 0) - (e.id === this.lastTargetId && t - this.lastTargetT < 3 ? 70 : 0) + (los ? 0 : 80)
+      if (s < bestScore) { bestScore = s; target = e }
+    }
+    // NPC that is shooting us or that we can farm
+    const mechThreatNear = mechs.some((e) => d2(e.pos, p) < 150)
+    let npcTarget: Enemy | null = null
+    if (!target) {
+      let bd = Infinity
+      for (const e of npcs) {
+        const dd = d2(e.pos, p)
+        const attacker = this.attackers.has(e.id) && t - this.attackers.get(e.id)!.t < 4
+        const farm = !mechThreatNear && hpFrac > 0.55 && dd < 90 && (gunOk || ltg || laser) && !zoneUrgent
+        if ((attacker || farm) && visibleNow.has(e.id) && hasLos(e) && dd < bd) { bd = dd; npcTarget = e }
+      }
+    }
+    const fightTarget = target ?? npcTarget
+    if (target) { this.lastTargetId = target.id; this.lastTargetT = t }
+
+    // ---- movement decision
+    let moveDir: number[] = [0, 0]
+    let boost = false
+    let lookYaw: number | null = null
+    const threatsPos = mechs.filter((e) => d2(e.pos, p) < 220).map((e) => e.pos)
+    const avoid = mechs.filter((e) => t - e.seen < 8).map((e) => ({ x: e.pos[0], y: e.pos[1], r: 70, w: 4 }))
+    let wantTake: number | null = null
+    let wantDrop: number | undefined
+
+    // pickups in range: take them whenever useful
+    const pickupWant = (pk: PickupObs): { val: number; drop?: number } | null => {
+      if ((this.badPickups.get(pk.id) ?? -1) > t) return null
+      if (me.weapons.some((w) => w && w.kind === pk.kind)) return null
+      const v = WEAPON_VALUE[pk.kind] ?? 0
+      const empty = me.weapons.findIndex((w) => !w)
+      if (empty >= 0) return v > 0 ? { val: v } : null
+      // both slots full: swap the worst one if this is better
+      let worst = -1, wv = Infinity
+      me.weapons.forEach((w, i) => {
+        if (!w) return
+        let val = WEAPON_VALUE[w.kind] ?? 0
+        if (w.kind === "gun") val = laser && pk.kind === "lightning" || ltg && pk.kind === "laser" ? 0.5 : 2.5
+        if (w.kind === "laser" && (w.charge ?? 0) > 0) val = 99
+        if (val < wv) { wv = val; worst = i }
+      })
+      if (worst >= 0 && v > wv + 0.4) return { val: v - wv, drop: worst }
+      return null
+    }
+    for (const pk of obs.pickups) {
+      const dh = d2(pk.pos, p), dz = Math.abs(pk.pos[2] - p[2])
+      if (dh <= (this.cfg.loot.pickup_radius ?? 4) - 0.2 && dz < 3.8) {
+        const wnt = pickupWant(pk)
+        if (wnt) { wantTake = pk.id; wantDrop = wnt.drop; break }
+      }
+    }
+
+    const inCombat = !!fightTarget || recentlyHit
+    const unseenHit = !fightTarget && this.taken.some((x) => t - x.t < 2.5) && this.threatBearings.some((b) => b.kind === "damage" && t - b.t < 2.5)
+    const taken6 = this.taken.reduce((a, x) => a + x.a, 0)
+    const dealt6 = this.dealt.reduce((a, x) => a + x.a, 0)
+    const nearEnemies = mechs.filter((e) => d2(e.pos, p) < 120).length
+    let retreatNow = false
+    if (target && z.next_radius > 30) {
+      const eFrac = target.hp / target.maxHp
+      if (hpFrac < 0.33 && (eFrac > hpFrac + 0.05 || nearEnemies > 1)) retreatNow = true
+      if (hpFrac < this.retreatHp && taken6 > dealt6 * 1.5 + 250 && eFrac > 0.3) retreatNow = true
+      if (nearEnemies > 2 && hpFrac < 0.7) retreatNow = true
+    }
+    if (retreatNow) this.retreatUntil = t + 2.5
+    const retreat = t < this.retreatUntil && z.next_radius > 30 && !(target && target.hp / target.maxHp < 0.15 && hasLos(target))
+
+    if (zoneUrgent && !(fightTarget && !outsideNow && tOut > needT * 1.2 + 3)) {
+      this.mode = "zone"
+      moveDir = this.navTo(obs, safePt, inCombat ? [] : avoid)
+      boost = outsideNow || needT * 1.15 + 2 > tOut || (me.energy > 50 && needT > 4)
+    } else if (retreat && (target || recentlyHit)) {
+      this.mode = "retreat"
+      if (!this.retreatSpot || t - this.retreatSpotT > 1.5) {
+        this.retreatSpot = this.findRetreat(p, threatsPos, safeC, Math.max(safeR + marginNext * 0.8, 20))
+        this.retreatSpotT = t
+      }
+      const spot = this.retreatSpot
+      if (spot) moveDir = this.navTo(obs, spot)
+      else if (target) {
+        const dx = p[0] - target.pos[0], dy = p[1] - target.pos[1], L = Math.hypot(dx, dy) || 1
+        moveDir = this.freeDir(p, [dx / L, dy / L])
+      }
+      boost = me.energy > 15
+    } else if (unseenHit && !zoneUrgent) {
+      // shot by someone we can't see: turn to them (aim below) and get out of their line
+      this.mode = "evade"
+      const b = this.threatBearings.filter((x) => x.kind === "damage").sort((a, c) => c.t - a.t)[0]
+      if (!this.retreatSpot || t - this.retreatSpotT > 1.5) {
+        const fake = [p[0] + Math.cos(b.bearing) * 90, p[1] + Math.sin(b.bearing) * 90, p[2]]
+        this.retreatSpot = this.findRetreat(p, [fake], safeC, Math.max(safeR + marginNext * 0.8, 20))
+        this.retreatSpotT = t
+      }
+      if (this.retreatSpot) moveDir = this.navTo(obs, this.retreatSpot)
+      else moveDir = this.freeDir(p, [-Math.sin(b.bearing) * this.strafeSign, Math.cos(b.bearing) * this.strafeSign])
+      boost = me.energy > 40
+    } else if (fightTarget) {
+      this.mode = target ? "fight" : "npc"
+      const e = fightTarget
+      const dx = e.pos[0] - p[0], dy = e.pos[1] - p[1], dd = Math.hypot(dx, dy) || 1
+      const ux = dx / dd, uy = dy / dd
+      if (t > this.strafeFlipT) {
+        this.strafeSign = this.rng() < 0.5 ? -1 : 1
+        this.strafeFlipT = t + 0.45 + this.rng() * 0.9
+      }
+      // preferred distance
+      let pref = 90
+      const eHasLtg = e.weapons.includes("lightning")
+      if (ltg && !eHasLtg) pref = 25
+      else if (ltg && eHasLtg) pref = laser ? 70 : 28
+      else if (eHasLtg) pref = 75
+      if (e.npc) pref = ltg ? 30 : 50
+      let radial = 0
+      if (dd > pref + 15) radial = hpFrac > 0.45 ? 0.7 : 0
+      else if (dd < pref - 15) radial = -0.6
+      let mx = -uy * this.strafeSign + ux * radial, my = ux * this.strafeSign + uy * radial
+      // dodge a laser that is charging at us
+      if (e.charging && Math.abs(angDiff(e.aim[0], Math.atan2(-dy, -dx))) < 0.25) {
+        mx = -uy * this.strafeSign; my = ux * this.strafeSign
+        boost = me.energy > 10
+      }
+      // stay in the zone
+      if (d2(p, safeC) > safeR && z.next_radius > 0) {
+        const zx = safeC[0] - p[0], zy = safeC[1] - p[1], zl = Math.hypot(zx, zy) || 1
+        const k = clamp((d2(p, safeC) - safeR) / 30, 0, 1)
+        mx += (zx / zl) * k; my += (zy / zl) * k
+      }
+      // need a path if the target is far and out of sight
+      if (!hasLos(e) && dd > 25 && !e.npc && hpFrac > 0.5) moveDir = this.navTo(obs, e.pos)
+      else {
+        const l = Math.hypot(mx, my) || 1
+        moveDir = this.freeDir(p, [mx / l, my / l])
+      }
+    } else {
+      // ---- loot / objective / hold
+      let goal: number[] | null = null
+      let goalKind = ""
+      const safeTime = tOut === Infinity ? 1e9 : tOut - needT * 1.4
+      // supply drop
+      for (const dr of obs.drops) {
+        const dd = d2(dr.pos, p)
+        const contested = mechs.some((e) => d2(e.pos, dr.pos) < 45 && t - e.seen < 4)
+        if (dd < 170 && dr.lands_in < dd / walk + 8 && !contested && ptOk(dr.pos) && (dr.holder == null || dr.holder === me.id)) {
+          goal = [dr.pos[0], dr.pos[1]]
+          goalKind = "drop"
+          if (dd < dr.radius - 2) goal = [p[0], p[1]]
+          break
+        }
+      }
+      // weapons
+      if (!goal) {
+        let bv = -Infinity
+        for (const [, m] of this.pickups) {
+          const pk = m.item
+          const wnt = pickupWant(pk)
+          if (!wnt) continue
+          const dd = d2(pk.pos, p)
+          if (dd > 160) continue
+          if (Math.abs(pk.pos[2] - (this.world?.ground(pk.pos[0], pk.pos[1]) ?? pk.pos[2])) > 2) continue // on a roof
+          if (!ptOk(pk.pos)) continue
+          const v = wnt.val * 60 - dd
+          if (v > bv) { bv = v; goal = [pk.pos[0], pk.pos[1]]; goalKind = "loot" }
+        }
+      }
+      // cubes
+      if (!goal) {
+        let bd = 120
+        for (const [, m] of this.cubes) {
+          const c = m.item
+          const dd = d2(c.pos, p)
+          if (Math.abs(c.pos[2] - (this.world?.ground(c.pos[0], c.pos[1]) ?? c.pos[2])) > 2) continue
+          if (dd < bd && ptOk(c.pos)) { bd = dd; goal = [c.pos[0], c.pos[1]]; goalKind = "cube" }
+        }
+      }
+      if (goal && safeTime < 5) goal = null
+      if (goal) {
+        this.mode = goalKind
+        this.holdSpot = null
+        moveDir = d2(goal, p) < 0.6 ? [0, 0] : this.navTo(obs, goal, avoid)
+        if (goalKind === "drop" && d2(goal, p) < 3) moveDir = [0, 0]
+      } else {
+        this.mode = "hold"
+        const key = `${z.next_center[0].toFixed(0)},${z.next_center[1].toFixed(0)},${z.next_radius.toFixed(0)}`
+        if (!this.holdSpot || this.holdKey !== key || d2(this.holdSpot, safeC) > safeR) {
+          const rad = Math.min(45, Math.max(2, safeR * 0.5))
+          this.holdSpot = this.findHoldSpot(safePt, rad, safeC, Math.max(2, safeR), threatsPos)
+          this.holdKey = key
+        }
+        if (d2(this.holdSpot, p) > 2.5) moveDir = this.navTo(obs, this.holdSpot, avoid)
+        // walk slowly (silently) when close
+        const dh = d2(this.holdSpot, p)
+        if (dh < 20 && !zoneUrgent) {
+          const k = Math.min(1, 0.4 + dh / 40)
+          moveDir = [moveDir[0] * k, moveDir[1] * k]
+        }
+      }
+    }
+
+    // ---- dodge projectiles
+    for (const pr of obs.projectiles) {
+      if (pr.kind === "mortar") {
+        // predict landing
+        const g = this.cfg.weapons.mortar.gravity ?? 22
+        let lp: number[] | null = null
+        for (let k = 1; k <= 40; k++) {
+          const T = k * 0.1
+          const x = pr.pos[0] + pr.vel[0] * T, y = pr.pos[1] + pr.vel[1] * T, zz = pr.pos[2] + pr.vel[2] * T - 0.5 * g * T * T
+          if (this.world && zz < this.world.ground(x, y)) { lp = [x, y]; break }
+        }
+        if (lp && d2(lp, p) < (this.cfg.weapons.mortar.splash_radius ?? 7) + 5) {
+          const dx = p[0] - lp[0], dy = p[1] - lp[1], L = Math.hypot(dx, dy) || 1
+          moveDir = this.freeDir(p, [dx / L, dy / L])
+          boost = me.energy > 5
+        }
+      } else {
+        const rx = pr.pos[0] - p[0], ry = pr.pos[1] - p[1]
+        const vx = pr.vel[0], vy = pr.vel[1]
+        const vv = vx * vx + vy * vy
+        if (vv < 1) continue
+        const tca = -(rx * vx + ry * vy) / vv
+        if (tca < 0 || tca > 0.8) continue
+        const cx = rx + vx * tca, cy = ry + vy * tca
+        const miss = Math.hypot(cx, cy)
+        if (miss < 3 * sc && tca > 0.12) {
+          const vl = Math.sqrt(vv)
+          let nx = -vy / vl, ny = vx / vl
+          if (nx * cx + ny * cy > 0) { nx = -nx; ny = -ny }
+          const dir = this.freeDir(p, [nx, ny])
+          moveDir = [moveDir[0] * 0.3 + dir[0], moveDir[1] * 0.3 + dir[1]]
+        }
+      }
+    }
+
+    // ---- stuck handling
+    const ml = Math.hypot(moveDir[0], moveDir[1])
+    if (t - this.stuckRef.t > 1.0) {
+      const moved = d2(this.stuckRef.p, p)
+      if (ml > 0.5 && moved < 1.2 && t > 1 && me.grounded) {
+        this.stuckUntil = t + 0.7
+        this.unstickDir = this.rng() < 0.5 ? 1 : -1
+        this.path = null
+      }
+      this.stuckRef = { t, p: [p[0], p[1]] }
+    }
+    if (t < this.stuckUntil && ml > 0.1) {
+      act.jump = me.grounded
+      boost = me.energy > 10
+      const a = Math.atan2(moveDir[1], moveDir[0]) + this.unstickDir * 0.6
+      moveDir = [Math.cos(a), Math.sin(a)]
+    }
+    {
+      const l = Math.hypot(moveDir[0], moveDir[1])
+      if (l > 1) moveDir = [moveDir[0] / l, moveDir[1] / l]
+    }
+    act.move = [moveDir[0], moveDir[1]]
+    act.boost = boost && Math.hypot(moveDir[0], moveDir[1]) > 0.3
+
+    // ---- aim and fire
+    const fire = [false, false]
+    let aim: [number, number] | null = null
+    if (laser && (laser.charge ?? 0) > 0 && !fightTarget) {
+      // charging with nothing to shoot: keep holding a little, then let it go
+      if (this.laserHoldStart < 0) this.laserHoldStart = t
+      if (t - this.laserHoldStart < 1.2) fire[laserSlot] = true
+    }
+    if (fightTarget) {
+      const e = fightTarget
+      const sce = e.npc ? 0.72 : this.scale(e.cubes)
+      const hw = (e.npc ? 1.8 : 2.5 * sce) * 1.05
+      const hh = (e.npc ? 1.75 : 4.5 * sce) * 0.95
+      const dd = Math.hypot(e.pos[0] - p[0], e.pos[1] - p[1])
+      const center = [e.pos[0], e.pos[1], e.pos[2] + (e.npc ? 1.75 : 4.5 * sce)]
+      const los = hasLos(e)
+      const lr = ltg?.stats.range ?? 45
+      const lcone = ((ltg?.stats.cone_deg ?? 30) * Math.PI) / 180 / 2
+      const laserReady = !!laser && ((laser.charge ?? 0) > 0 || laser.cooldown < 0.4)
+      const gunSpeed = gun?.stats.speed ?? 252
+      let primary = "none"
+      if (ltg && dd < lr * 0.95 && los) primary = "lightning"
+      else if (laserReady && los && dd < (laser!.stats.range ?? 280)) primary = "laser"
+      else if (gunOk && los && dd < (gun!.stats.range ?? 230)) primary = "gun"
+      else if (mortar && mortar.cooldown < 0.5 && dd > 22 && dd < 220) primary = "mortar"
+      else if (laser && los) primary = "laser"
+      else if (gun && los) primary = "gun"
+
+      if (primary === "lightning" || primary === "laser" || primary === "none") {
+        const lead = this.leadPoint(muzzle, e, 1e9, 0.08)
+        aim = this.aimAt(muzzle, lead)
+      } else if (primary === "gun") {
+        aim = this.aimAt(muzzle, this.leadPoint(muzzle, e, gunSpeed, 0.05))
+      } else if (primary === "mortar") {
+        const mv = mortar!.stats.speed ?? 72, mg = mortar!.stats.gravity ?? 22
+        const mz = [p[0], p[1], p[2] + 9 * sc + 0.5]
+        let tgt = [e.pos[0], e.pos[1], e.pos[2] + 1]
+        let sol: [number, number] | null = null
+        let useHigh = !los
+        for (let i = 0; i < 3; i++) {
+          sol = this.mortarPitch(mz, tgt, mv, mg)
+          if (!sol) break
+          const th = useHigh ? sol[1] : sol[0]
+          const T = Math.hypot(tgt[0] - mz[0], tgt[1] - mz[1]) / (mv * Math.cos(th))
+          tgt = [e.pos[0] + e.vel[0] * T, e.pos[1] + e.vel[1] * T, e.pos[2] + 1]
+        }
+        if (sol) {
+          const pitch = clamp(useHigh ? sol[1] : sol[0], this.cfg.mech.min_pitch ?? -0.7, this.cfg.mech.max_pitch ?? 1.3)
+          aim = [Math.atan2(tgt[1] - mz[1], tgt[0] - mz[0]), pitch]
+          const D = Math.hypot(tgt[0] - mz[0], tgt[1] - mz[1])
+          if (mortar!.cooldown <= 0 && Math.abs(angDiff(me.aim[0], aim[0])) * D < 2.5 && Math.abs(me.aim[1] - pitch) < 0.03) fire[mortarSlot] = true
+        } else {
+          aim = this.aimAt(muzzle, center)
+        }
+      }
+      // fire whatever is lined up
+      if (gun && gunOk && los && dd < (gun.stats.range ?? 230)) {
+        const lp = this.leadPoint(muzzle, e, gunSpeed, 0.05)
+        if (gun.cooldown <= 0.1 && this.onTarget(me, muzzle, lp, hw, hh)) {
+          const hit = this.world ? this.world.segHit(muzzle, lp) : -1
+          if (hit < 0) fire[gunSlot] = true
+        }
+      }
+      if (ltg && los && dd < lr * 0.97 && me.energy >= (ltg.stats.energy ?? 3)) {
+        if (Math.abs(angDiff(me.aim[0], Math.atan2(e.pos[1] - p[1], e.pos[0] - p[0]))) < lcone * 0.85) fire[ltgSlot] = true
+      }
+      if (laser) {
+        const charge = laser.charge ?? 0
+        const full = laser.stats.charge ?? 0.75
+        if (charge > 0) {
+          if (this.laserHoldStart < 0) this.laserHoldStart = t
+          const lead = this.leadPoint(muzzle, e, 1e9, 0.0)
+          const ready = charge >= full - 0.06
+          const on = los && this.onTarget(me, muzzle, lead, hw * 0.9, hh)
+          // release (fire) when fully charged and on target
+          if (ready && on) fire[laserSlot] = false
+          else if (t - this.laserHoldStart > full + 1.6) fire[laserSlot] = false
+          else fire[laserSlot] = true
+        } else {
+          this.laserHoldStart = -1
+          if (laser.cooldown <= 0.05 && los && dd < (laser.stats.range ?? 280) && primary === "laser") fire[laserSlot] = true
+        }
+      }
+    } else {
+      if (!(laser && (laser.charge ?? 0) > 0)) this.laserHoldStart = -1
+      // shoot crates for loot when it is calm
+      const calm = !mechThreatNear && t - this.lastDamageT > 6 && !zoneUrgent
+      if (calm && gun && gunOk) {
+        let best: { id: number; pos: number[]; hp: number } | null = null, bd = 70
+        for (const [, m] of this.crates) {
+          if (m.seen < t) continue
+          const dd = d2(m.item.pos, p)
+          if (dd < bd && dd > 4) {
+            const cp = [m.item.pos[0], m.item.pos[1], m.item.pos[2] + 1.2]
+            if (this.world && this.world.segHit(muzzle, cp) >= 0) continue
+            bd = dd; best = m.item
+          }
+        }
+        if (best) {
+          const cp = [best.pos[0], best.pos[1], best.pos[2] + 1.2]
+          aim = this.aimAt(muzzle, cp)
+          if (gun.cooldown <= 0.1 && this.onTarget(me, muzzle, cp, 1.0, 1.0)) fire[gunSlot] = true
+          this.mode += "+crate"
+        }
+      }
+    }
+
+    // where to look when not shooting
+    if (!aim) {
+      const recent = this.threatBearings.filter((b) => t - b.t < 3).sort((a, b) => b.t - a.t)
+      // remembered enemy that is not visible: watch it
+      const watch = mechs.filter((e) => d2(e.pos, p) < 200).sort((a, b) => d2(a.pos, p) - d2(b.pos, p))[0]
+      const dmg = this.threatBearings.filter((b) => b.kind === "damage" && t - b.t < 2.5).sort((a, b) => b.t - a.t)[0]
+      if (dmg) lookYaw = dmg.bearing
+      else if (watch) lookYaw = Math.atan2(watch.pos[1] - p[1], watch.pos[0] - p[0])
+      else if (recent.length) lookYaw = recent[0].bearing
+      else {
+        const mvYaw = Math.hypot(moveDir[0], moveDir[1]) > 0.3 ? Math.atan2(moveDir[1], moveDir[0]) : null
+        if (t > this.scanT) {
+          this.scanT = t + 1.4 + this.rng()
+          this.scanIdx++
+        }
+        if (mvYaw !== null && this.mode !== "hold") {
+          const offs = [0, 0.9, 0, -0.9]
+          lookYaw = mvYaw + offs[this.scanIdx % 4]
+        } else {
+          // scan the open directions, biased to the zone center
+          const toC = Math.atan2(safeC[1] - p[1], safeC[0] - p[0])
+          const offs = [0, 1.6, 3.14, -1.6, 0.8, -0.8]
+          lookYaw = (d2(p, safeC) > 15 ? toC : me.aim[0]) + offs[this.scanIdx % offs.length]
+        }
+      }
+      aim = [lookYaw, 0]
+      // reload when nothing to shoot
+      if (gun && !(gun.reload > 0) && (gun.ammo ?? 12) < (gun.stats.mag ?? 12) * 0.7 && t - this.lastDamageT > 1.5) act.reload = true
+    }
+    if (gun && (gun.ammo ?? 1) === 0 && !(gun.reload > 0)) act.reload = true
+    act.aim = [wrap(aim[0]), clamp(aim[1], this.cfg.mech.min_pitch ?? -0.7, this.cfg.mech.max_pitch ?? 1.3)]
+    act.fire = [fire[0], fire[1]]
+    if (wantTake !== null) {
+      act.take = wantTake
+      if (wantDrop !== undefined) act.drop = wantDrop
+    }
+    labels.push(`${this.mode} hp${Math.round(me.hp)} e${Math.round(me.energy)}${fightTarget ? " t" + fightTarget.id : ""}`)
+    this.label = labels.join(" ")
+    return act
+  }
+  label = ""
+}
