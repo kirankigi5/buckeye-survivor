@@ -3,7 +3,7 @@ import type { ActorObs, BotAction, Hello, Observation, PickupObs, SelfObs, Weapo
 import { World } from "./world.ts"
 
 const env = (globalThis as any).process?.env ?? {}
-export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1" }
+export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1" }
 const TAU = Math.PI * 2
 const wrap = (a: number) => {
   a = (a + Math.PI) % TAU
@@ -63,6 +63,8 @@ export class Brain {
   holdSpot: number[] | null = null
   holdKey = ""
   holdRefineT = -100
+  patrol: number[] | null = null
+  patrolT = 0
   scanT = 0
   scanIdx = 0
   lastTargetId = -1
@@ -389,7 +391,7 @@ export class Brain {
   // ---------------------------------------------------------------- main
   tickStart = 0
   /** ms left of this decision's compute budget */
-  left(total = 9) {
+  left(total = OPT.budget) {
     return total - (performance.now() - this.tickStart)
   }
 
@@ -765,7 +767,11 @@ export class Brain {
         const hkey = key + (hiding ? "h" : "")
         if (!this.holdSpot || this.holdKey !== hkey || (!hiding && d2(this.holdSpot, safeC) > safeR)) {
           if (hiding) this.holdSpot = this.findHoldSpot([p[0], p[1]], 50, curZ.c, Math.max(2, curZ.r - 15), threatsPos)
-          else {
+          else if (OPT.edge && safeR > 40) {
+            const dx = p[0] - safeC[0], dy = p[1] - safeC[1], L = Math.hypot(dx, dy) || 1
+            const ec = [safeC[0] + (dx / L) * safeR * 0.78, safeC[1] + (dy / L) * safeR * 0.78]
+            this.holdSpot = this.findHoldSpot(ec, Math.min(40, safeR * 0.2), safeC, Math.max(2, safeR * 0.95), threatsPos)
+          } else {
             const rad = Math.min(45, Math.max(2, safeR * 0.5))
             this.holdSpot = this.findHoldSpot(safePt, rad, safeC, Math.max(2, safeR), threatsPos)
           }
@@ -779,10 +785,21 @@ export class Brain {
           const cs = this.concealment(cand[0], cand[1]), hs = this.concealment(this.holdSpot[0], this.holdSpot[1])
           if (cs > hs + 0.12 && d2(cand, p) < 90) this.holdSpot = cand
         }
-        if (d2(this.holdSpot, p) > 2.5) moveDir = this.navTo(obs, this.holdSpot, avoid)
+        if (OPT.mover && d2(this.holdSpot, p) < 14) {
+          if (t > this.patrolT || !this.patrol || d2(this.patrol, p) < 2.5) {
+            for (let k = 0; k < 8; k++) {
+              const a = this.rng() * TAU, r = 5 + this.rng() * 9
+              const q = [this.holdSpot[0] + Math.cos(a) * r, this.holdSpot[1] + Math.sin(a) * r]
+              if (this.world && this.world.isFree(q[0], q[1], 3)) { this.patrol = q; break }
+            }
+            this.patrolT = t + 1.5 + this.rng() * 2
+          }
+          if (this.patrol) moveDir = this.navTo(obs, this.patrol, avoid)
+          if (me.grounded && this.rng() < 0.04) act.jump = true
+        } else if (d2(this.holdSpot, p) > 2.5) moveDir = this.navTo(obs, this.holdSpot, avoid)
         // walk slowly (silently) when close
         const dh = d2(this.holdSpot, p)
-        if (dh < 20 && !zoneUrgent) {
+        if (dh < 20 && !zoneUrgent && !OPT.mover) {
           const k = Math.min(1, 0.4 + dh / 40)
           moveDir = [moveDir[0] * k, moveDir[1] * k]
         }
