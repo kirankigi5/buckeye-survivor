@@ -3,7 +3,7 @@ import type { ActorObs, BotAction, Hello, Observation, PickupObs, SelfObs, Weapo
 import { World } from "./world.ts"
 
 const env = (globalThis as any).process?.env ?? {}
-export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0", finish: env.MF_FINISH === "1", recover: env.MF_RECOVER === "1", seek: env.MF_SEEK === "1" }
+export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0", finish: env.MF_FINISH === "1", recover: env.MF_RECOVER === "1", seek: env.MF_SEEK === "1", arc: env.MF_ARC === "1" }
 const TAU = Math.PI * 2
 const wrap = (a: number) => {
   a = (a + Math.PI) % TAU
@@ -79,6 +79,8 @@ export class Brain {
   recoverSpotT = -99
   seekGoal: number[] | null = null
   seekT = -99
+  laserFiredT = new Map<number, number>()
+  obsT = 0
   lastTargetT = -100
   lastKill: { pos: number[]; t: number } | null = null
   t = 0
@@ -154,9 +156,19 @@ export class Brain {
     return Infinity
   }
 
+  // Extra damage we deal: rear hits (x rear_mult) and laser cook-off on mortar carriers.
+  exposure(e: Enemy, p: number[], laser: boolean): number {
+    const toMe = Math.atan2(p[1] - e.pos[1], p[0] - e.pos[0])
+    let bonus = Math.abs(angDiff(e.aim[0], toMe)) > Math.PI / 2 ? 45 : 0
+    if (laser && e.weapons.includes("mortar")) bonus += 30
+    if (this.obsT - (this.laserFiredT.get(e.id) ?? -99) < 1.3) bonus += 50
+    return bonus
+  }
+
   // ---------------------------------------------------------------- memory
   observe(obs: Observation) {
     const t = obs.t
+    this.obsT = t
     const me = obs.self
     for (const m of obs.mechs) {
       const e: Enemy = {
@@ -166,6 +178,7 @@ export class Brain {
       this.enemies.set(m.id, e)
     }
     for (const [id, e] of this.enemies) if (t - e.seen > (e.npc ? 40 : 12)) this.enemies.delete(id)
+    for (const b of obs.beams ?? []) if (b.kind === "laser" && b.by != null) this.laserFiredT.set(b.by, t - (b.age ?? 0))
     for (const p of obs.pickups) this.pickups.set(p.id, { item: p, seen: t })
     for (const c of obs.cubes) this.cubes.set(c.id, { item: c, seen: t })
     for (const c of obs.crates) this.crates.set(c.id, { item: { id: c.id, pos: c.pos, hp: c.hp ?? 300 }, seen: t })
@@ -580,7 +593,7 @@ export class Brain {
       if (OPT.finish && !engage && eFrac < 0.45 && hpFrac > 0.4 && dd < 220) engage = true
       if (!engage) continue
       const recentDmg = this.taken.reduce((a, x) => a + (x.by === e.id && t - x.t < 3 ? x.a : 0), 0)
-      let s = dd + e.hp / 12 - recentDmg / 3 - (attacker ? 60 : 0) - (e.id === this.lastTargetId && t - this.lastTargetT < 3 ? 70 : 0) + (los ? 0 : 80) - (OPT.finish ? (1 - eFrac) * 120 : 0)
+      let s = dd + e.hp / 12 - recentDmg / 3 - (attacker ? 60 : 0) - (e.id === this.lastTargetId && t - this.lastTargetT < 3 ? 70 : 0) + (los ? 0 : 80) - (OPT.finish ? (1 - eFrac) * 120 : 0) - (OPT.arc ? this.exposure(e, p, !!laser) : 0)
       if (s < bestScore) { bestScore = s; target = e }
     }
     // NPC that is shooting us or that we can farm
@@ -761,6 +774,8 @@ export class Brain {
         if (hpFrac < 0.65 && taken6 - dealt6 > 260 && target.hp > me.hp + 150) retreatNow = true
       }
     }
+    const punish = OPT.arc && !!target && t - (this.laserFiredT.get(target.id) ?? -99) < 1.3 && hpFrac > 0.3 && nearEnemies < 3
+    if (punish && target!.hp < me.hp * 1.6) retreatNow = false
     if (retreatNow) this.retreatUntil = t + 2.5
     const retreat = t < this.retreatUntil && z.next_radius > 30 && !(target && target.hp / target.maxHp < 0.15 && hasLos(target))
 
@@ -898,7 +913,26 @@ export class Brain {
           radial = 0.65
         }
       }
+      if (OPT.arc && !e.npc && t - (this.laserFiredT.get(e.id) ?? -99) < 1.3 && hpFrac > 0.3 && !closing && dd > 20) {
+        // its laser is on cooldown: close in and fight instead of kiting
+        radial = Math.max(radial, 0.6)
+        lateral *= 0.6
+      }
       let mx = -uy * lateral + ux * radial, my = ux * lateral + uy * radial
+      if (OPT.arc && !e.npc) {
+        // keep other shooters inside the torso's front arc: step out from between them
+        const toE = Math.atan2(dy, dx)
+        for (const o of mechs) {
+          if (o.id === e.id || t - o.seen > 2) continue
+          const od = d2(o.pos, p)
+          if (od > 170 || od < 1) continue
+          const sep = Math.abs(angDiff(Math.atan2(o.pos[1] - p[1], o.pos[0] - p[0]), toE))
+          if (sep < 1.2) continue
+          const w = 0.9 * clamp((sep - 1.2) / 0.8, 0.3, 1)
+          mx += ((p[0] - o.pos[0]) / od) * w - ux * w * 0.4
+          my += ((p[1] - o.pos[1]) / od) * w - uy * w * 0.4
+        }
+      }
       // dodge a laser that is charging at us
       if (e.charging && Math.abs(angDiff(e.aim[0], Math.atan2(-dy, -dx))) < 0.25) {
         const sg = this.strafeSign || 1
