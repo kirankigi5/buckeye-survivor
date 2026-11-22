@@ -3,7 +3,7 @@ import type { ActorObs, BotAction, Hello, Observation, PickupObs, SelfObs, Weapo
 import { World } from "./world.ts"
 
 const env = (globalThis as any).process?.env ?? {}
-export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0" }
+export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0" }
 const TAU = Math.PI * 2
 const wrap = (a: number) => {
   a = (a + Math.PI) % TAU
@@ -18,8 +18,8 @@ type Enemy = { id: number; pos: number[]; vel: number[]; aim: number[]; hp: numb
 type Mem<T> = { item: T; seen: number }
 
 const UPGRADE_PRIORITY = [
-  "armor", "plating", "nanites", "laser_damage", "laser_charge", "lightning_efficiency", "lightning_range",
-  "gun_rate", "gun_damage", "gyros", "lightning_chain", "servos", "gun_mag", "gun_velocity", "capacitor",
+  "armor", "plating", "gun_damage", "laser_damage", "nanites", "laser_charge", "lightning_efficiency", "lightning_range",
+  "gun_rate", "gyros", "lightning_chain", "servos", "gun_mag", "gun_velocity", "capacitor",
   "reactor", "jets", "mortar_reload", "mortar_velocity", "mortar_splash", "sensors", "laser_pierce",
 ]
 const WEAPON_VALUE: Record<string, number> = { laser: 3, lightning: 3, mortar: 1, gun: 0 }
@@ -50,6 +50,12 @@ export class Brain {
   stuckRef: { t: number; p: number[] } = { t: 0, p: [0, 0] }
   stuckUntil = -1
   unstickDir = 0
+
+  // spawn rush
+  spawnRushTarget: number[] | null = null
+  spawnRushId: number | null = null
+  spawnRushSeen = -100
+  spawnRushDone = false
 
   // combat
   strafeSign = 1
@@ -574,6 +580,78 @@ export class Brain {
         if ((attacker || farm) && visibleNow.has(e.id) && hasLos(e) && dd < bd) { bd = dd; npcTarget = e }
       }
     }
+    // Opening farm: keep a drone by id through turns and brief occlusion. A
+    // sound is only a search waypoint; it never creates a shootable enemy.
+    let rushGoal: number[] | null = null
+    let rushEnemy: Enemy | null = null
+    if (!OPT.farm || !OPT.rush || t > 30 || me.cubes >= 2 || hpFrac < 0.6) {
+      this.spawnRushDone = true
+      this.spawnRushTarget = null
+      this.spawnRushId = null
+    }
+    const rushSafe = (q: number[], killTime: number) => {
+      const travel = d2(p, q) / walk * 1.4 + killTime
+      const escape = Math.max(0, d2(q, safeC) - safeR) / walk * 1.4
+      return !outsideNow && travel + escape + 6 < Math.min(tOut, this.timeUntilOut(obs, q))
+    }
+    if (!this.spawnRushDone) {
+      let e = this.spawnRushId === null ? null : this.enemies.get(this.spawnRushId) ?? null
+      // A real sighting replaces a bearing-only search immediately.
+      if (this.spawnRushId === null) {
+        e = npcs.filter((n) => visibleNow.has(n.id) && d2(n.pos, p) < 190 && rushSafe(n.pos, 4))
+          .sort((a, b) => d2(a.pos, p) - d2(b.pos, p))[0] ?? null
+        if (e) this.spawnRushId = e.id
+      }
+      if (e && visibleNow.has(e.id)) {
+        this.spawnRushTarget = e.pos.slice()
+        this.spawnRushSeen = t
+      }
+      // Prefer the cubes from the opening kill over a different weapon or drone.
+      const reward = [...this.cubes.values()].filter((c) => this.spawnRushTarget && d2(c.item.pos, this.spawnRushTarget) < 25)
+        .sort((a, b) => d2(a.item.pos, p) - d2(b.item.pos, p))[0]
+      if (reward && (!e || !visibleNow.has(e.id))) {
+        rushGoal = reward.item.pos
+      } else if (this.spawnRushTarget && t - this.spawnRushSeen < 8) {
+        rushGoal = this.spawnRushTarget
+        rushEnemy = e
+      } else {
+        this.spawnRushTarget = null
+        this.spawnRushId = null
+        e = [...this.enemies.values()].filter((n) => n.npc && t - n.seen < 3 && d2(n.pos, p) < 190 && rushSafe(n.pos, 4))
+          .sort((a, b) => d2(a.pos, p) - d2(b.pos, p))[0] ?? null
+        if (e) {
+          this.spawnRushId = e.id
+          this.spawnRushTarget = e.pos.slice()
+          this.spawnRushSeen = e.seen
+          rushGoal = e.pos
+          rushEnemy = e
+        } else {
+          const sound = obs.sounds.find((s) => s.kind === "npc_gun" && s.age < 1 && s.dist !== "far")
+          if (sound) {
+            const range = sound.dist === "near" ? this.cfg.sound.near * 0.7 : (this.cfg.sound.near + this.cfg.sound.mid) * 0.5
+            const q = [p[0] + Math.cos(sound.bearing) * range, p[1] + Math.sin(sound.bearing) * range, p[2]]
+            if (rushSafe(q, 4)) {
+              this.spawnRushTarget = q
+              this.spawnRushSeen = t - sound.age
+              rushGoal = q
+            }
+          }
+        }
+      }
+      const playerDanger = !!target || mechs.some((e) => d2(e.pos, p) < 80) || [...this.attackers.values()].some((a) => a.weapon !== "npc" && t - a.t < 3)
+      if (rushGoal && (playerDanger || !rushSafe(rushGoal, rushEnemy ? 4 : 0))) {
+        rushGoal = null
+        rushEnemy = null
+      }
+      // Reaching an empty last-known position means the kill/loot is gone.
+      if (rushGoal && !reward && (!rushEnemy || !visibleNow.has(rushEnemy.id)) && d2(rushGoal, p) < 7 && t - this.spawnRushSeen > 1) {
+        this.spawnRushTarget = null
+        this.spawnRushId = null
+        rushGoal = null
+        rushEnemy = null
+      }
+      if (rushEnemy && visibleNow.has(rushEnemy.id) && hasLos(rushEnemy) && !target) npcTarget = rushEnemy
+    }
     const fightTarget = target ?? npcTarget
     if (target) { this.lastTargetId = target.id; this.lastTargetT = t }
 
@@ -633,6 +711,16 @@ export class Brain {
       moveDir = this.navTo(obs, safePt, inCombat ? [] : avoid)
       const threatClose = mechs.some((e) => d2(e.pos, p) < 160)
       boost = (outsideNow && (z.dps >= 35 || needT > 3)) || needT * 1.15 + 2 > tOut || (me.energy > 90 && needT > 6 && !threatClose)
+    } else if (rushGoal && !retreat) {
+      this.mode = "rush"
+      const dd = d2(rushGoal, p)
+      // Close the distance to secure the reward. Keep enough room for the
+      // muzzle to pitch down at a short drone while it is still alive.
+      if (rushEnemy && visibleNow.has(rushEnemy.id) && dd < 13) {
+        const yaw = Math.atan2(rushGoal[1] - p[1], rushGoal[0] - p[0])
+        moveDir = this.freeDir(p, [-Math.sin(yaw), Math.cos(yaw)])
+      } else moveDir = dd < 0.8 ? [0, 0] : this.navTo(obs, rushGoal, avoid)
+      boost = dd > 30 && me.energy > (ltg ? 50 : 35)
     } else if (retreat && (target || recentlyHit)) {
       this.mode = "retreat"
       if (!this.retreatSpot || t - this.retreatSpotT > 1.5) {
@@ -909,6 +997,9 @@ export class Brain {
     // ---- aim and fire
     const fire = [false, false]
     let aim: [number, number] | null = null
+    if (this.mode === "rush" && rushGoal && !fightTarget) {
+      aim = [Math.atan2(rushGoal[1] - p[1], rushGoal[0] - p[0]), 0]
+    }
     if (laser && (laser.charge ?? 0) > 0 && !fightTarget) {
       // charging with nothing to shoot: keep holding a little, then let it go
       if (this.laserHoldStart < 0) this.laserHoldStart = t
@@ -992,7 +1083,7 @@ export class Brain {
     } else {
       if (!(laser && (laser.charge ?? 0) > 0)) this.laserHoldStart = -1
       // shoot crates for loot when it is calm
-      const calm = (OPT.farm || !OPT.stealth) && !mechThreatNear && t - this.lastDamageT > 6 && !zoneUrgent
+      const calm = this.mode !== "rush" && (OPT.farm || !OPT.stealth) && !mechThreatNear && t - this.lastDamageT > 6 && !zoneUrgent
       if (calm && ((gun && gunOk) || (ltg && me.energy > 40))) {
         let best: { id: number; pos: number[]; hp: number } | null = null, bd = OPT.farm ? 90 : 70
         for (const [, m] of this.crates) {
@@ -1023,6 +1114,7 @@ export class Brain {
       if (dmg) lookYaw = dmg.bearing
       else if (watch) lookYaw = Math.atan2(watch.pos[1] - p[1], watch.pos[0] - p[0])
       else if (recent.length) lookYaw = recent[0].bearing
+      else if (OPT.farm && OPT.rush && !this.spawnRushDone && t < 3) lookYaw = me.aim[0] + 1.1
       else {
         const mvYaw = Math.hypot(moveDir[0], moveDir[1]) > 0.3 ? Math.atan2(moveDir[1], moveDir[0]) : null
         if (t > this.scanT) {
