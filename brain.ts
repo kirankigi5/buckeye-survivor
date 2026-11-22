@@ -3,7 +3,6 @@ import type { ActorObs, BotAction, Hello, Observation, PickupObs, SelfObs, Weapo
 import { World } from "./world.ts"
 
 const env = (globalThis as any).process?.env ?? {}
-export const UPGRADE_MATH: { policy: "off" | "mag" | "model" } = { policy: env.MF_UPGRADE_MATH === "0" ? "off" : env.MF_UPGRADE_MATH === "mag" ? "mag" : "model" }
 export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0" }
 const TAU = Math.PI * 2
 const wrap = (a: number) => {
@@ -24,12 +23,6 @@ const UPGRADE_PRIORITY = [
   "reactor", "jets", "mortar_reload", "mortar_velocity", "mortar_splash", "sensors", "laser_pierce",
 ]
 const WEAPON_VALUE: Record<string, number> = { laser: 3, lightning: 3, mortar: 1, gun: 0 }
-// Share of damage against mechs in recorded public matches with these loadouts.
-const DAMAGE_SHARE: Record<string, number> = {
-  "gun/laser": 0.35, "laser/gun": 0.65,
-  "gun/lightning": 0.60, "lightning/gun": 0.40,
-  "laser/lightning": 0.61, "lightning/laser": 0.39,
-}
 
 export class Brain {
   cfg: any
@@ -118,47 +111,6 @@ export class Brain {
   }
   scale(cubes: number) {
     return 1 + (this.cfg.cubes.size_per_cube ?? 0.05) * (cubes || 0)
-  }
-
-  /** Approximate the change in effective health or sustained damage. */
-  upgradeValue(id: string, me: SelfObs): number {
-    const priority = UPGRADE_PRIORITY.indexOf(id)
-    const fallback = priority < 0 ? 0 : 0.065 - 0.0025 * priority
-    const upgrade = this.cfg.upgrades?.find((u: { id: string }) => u.id === id)
-    if (!upgrade) return fallback
-    const next = (path: string, value: number) => {
-      for (const effect of upgrade.effects) {
-        if (effect.path === path) value = value * (effect.mul ?? 1) + (effect.add ?? 0)
-      }
-      return value
-    }
-    if (id === "plating") return (next("mech.hp", me.max_hp) - me.max_hp) / Math.max(1, (me.hp + me.max_hp) * 0.5)
-    if (id === "armor") {
-      const armor = me.stats.armor ?? 0
-      return (1 - armor) / Math.max(0.05, 1 - next("mech.armor", armor)) - 1
-    }
-    const weapon = me.weapons.find((w) => w?.kind === upgrade.requires)
-    if (!weapon) return upgrade.requires ? 0 : fallback
-    const actual = weapon.stats
-    const path = `weapons.${weapon.kind}.`
-    const damage = actual.damage ?? 0
-    const cooldown = actual.cooldown
-    if (!(damage > 0) || !(cooldown > 0)) return fallback
-    let interval = cooldown, newInterval = next(path + "cooldown", cooldown)
-    const companion = me.weapons.find((w) => w && w !== weapon)
-    const share = !companion ? 1 : DAMAGE_SHARE[`${weapon.kind}/${companion.kind}`]
-      ?? (weapon.kind === "mortar" ? 0.2 : companion.kind === "mortar" ? 0.8 : 0.5)
-    if (weapon.kind === "gun") {
-      const mag = actual.mag ?? 12, reload = actual.reload ?? 2.4
-      // One magazine averages one cooldown per shot plus its share of the reload.
-      interval += reload / mag
-      newInterval += next(path + "reload", reload) / next(path + "mag", mag)
-    } else if (weapon.kind === "laser") {
-      interval += actual.charge ?? 0.75
-      newInterval += next(path + "charge", actual.charge ?? 0.75)
-    }
-    const gain = next(path + "damage", damage) / damage * interval / newInterval - 1
-    return Math.max(fallback, share * gain)
   }
   los(a: number[], b: number[]) {
     return this.world ? this.world.los(a, b) : true
@@ -537,13 +489,11 @@ export class Brain {
 
     // ---- upgrades
     if (obs.offer && obs.offer.choices.length) {
-      let bi = 0, bs = -Infinity
+      let bi = 0, bs = Infinity
       obs.offer.choices.forEach((c, i) => {
         const r = UPGRADE_PRIORITY.indexOf(c.id)
-        let score = -(r < 0 ? 100 : r)
-        if (UPGRADE_MATH.policy === "model") score = this.upgradeValue(c.id, me)
-        else if (UPGRADE_MATH.policy === "mag" && c.id === "gun_mag" && this.upgradeValue(c.id, me) > 0.16) score = -1.5
-        if (score > bs) { bs = score; bi = i }
+        const s = r < 0 ? 100 : r
+        if (s < bs) { bs = s; bi = i }
       })
       act.pick = bi
     }
