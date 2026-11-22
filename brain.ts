@@ -3,7 +3,7 @@ import type { ActorObs, BotAction, Hello, Observation, PickupObs, SelfObs, Weapo
 import { World } from "./world.ts"
 
 const env = (globalThis as any).process?.env ?? {}
-export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0" }
+export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1" }
 const TAU = Math.PI * 2
 const wrap = (a: number) => {
   a = (a + Math.PI) % TAU
@@ -543,7 +543,9 @@ export class Brain {
       const eFrac = e.hp / e.maxHp
       let engage = attacker || dd < 70 || (hpFrac > 0.5 && (dd < 130 || (laser && dd < 240)))
       if (hpFrac > 0.4 && eFrac < 0.35 && dd < 200) engage = true
-      if (OPT.stealth && !attacker) {
+      if (OPT.passive && !attacker) {
+        engage = dd < 35 || z.next_radius <= 25 || (eFrac < 0.2 && hpFrac > 0.6 && dd < 90)
+      } else if (OPT.stealth && !attacker) {
         const toMe = Math.atan2(p[1] - e.pos[1], p[0] - e.pos[0])
         const aware = Math.abs(angDiff(e.aim[0], toMe)) < 0.5
         engage = dd < 45 || (aware && dd < 90) || (eFrac < 0.3 && hpFrac > 0.5 && dd < 120) || z.next_radius <= 25
