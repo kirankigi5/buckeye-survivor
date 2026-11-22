@@ -58,8 +58,8 @@ test("sound guides search, and a sighting replaces its uncertain waypoint", () =
 })
 test("uses projectile lead and pitch checks rather than firing on yaw alone", () => {
   const { b, o, drone } = fixture(); drone.vel = [0, 10, 0]; const a = b.act(o)
-  assert.ok(a.aim![0] > 0); assert.equal(a.fire![0], false)
-  o.self.aim = [a.aim![0], 0.5]; step(o); assert.equal(b.act(o).fire![0], false)
+  assert.ok(a.aim![0] > 0)
+  o.self.aim = [a.aim![0], 1.2]; step(o); assert.equal(b.act(o).fire![0], false)
 })
 test("times out and can be disabled for paired evaluations", () => {
   const { b, o } = fixture(); step(o, 31); b.act(o); assert.equal(b.spawnRushDone, true)
@@ -95,13 +95,35 @@ test("late in the match does not chase a hunter that has not shot us", () => {
   assert.notEqual(b.mode, "fight")
 })
 
+test("does not farm a drone that is not nearby", () => {
+  const { b, o } = fixture()
+  step(o, 40)
+  o.self.cubes = 2
+  o.mechs = [{ id: 100, kind: "npc", pos: [80, 0, 0], vel: [0, 0, 0], aim: [0, 0], hp: 350, max_hp: 350 }]
+  b.act(o)
+  assert.notEqual(b.mode, "npc")
+  assert.notEqual(b.mode, "hunt")
+})
+
+test("boosts away from a hit when the trade is lost", () => {
+  const { b, o } = fixture()
+  step(o, 40)
+  o.self.hp = 500
+  o.mechs = [{ id: 3, kind: "mech", pos: [30, 0, 0], vel: [0, 0, 0], aim: [Math.PI, 0], hp: 1400, max_hp: 1400, weapons: ["gun"], charging: false }]
+  o.events = [{ type: "damaged", amount: 400, weapon: "gun", bearing: 0, by: 3 }]
+  const action = b.act(o)
+  assert.equal(b.mode, "kite")
+  assert.ok(action.move![0] < -0.4)
+  assert.equal(action.boost, true)
+})
+
 test("takes a short detour for a laser before committing to a distant drone", () => {
   const { b, o } = fixture()
   o.pickups = [{ id: 8000, kind: "laser", pos: [0, 40, 0] }]
   const action = b.act(o)
   assert.equal(b.mode, "equip")
   assert.ok(action.move![1] > 0.9)
-  assert.equal(action.boost, true)
+  assert.equal(action.boost, false)
 })
 
 test("prefers a laser to an in-range mortar", () => {
