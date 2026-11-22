@@ -95,6 +95,18 @@ test("late in the match does not chase a hunter that has not shot us", () => {
   assert.notEqual(b.mode, "fight")
 })
 
+test("boosts away from a hit when the trade is lost", () => {
+  const { b, o } = fixture()
+  step(o, 40)
+  o.self.hp = 500
+  o.mechs = [{ id: 3, kind: "mech", pos: [30, 0, 0], vel: [0, 0, 0], aim: [Math.PI, 0], hp: 1400, max_hp: 1400, weapons: ["gun"], charging: false }]
+  o.events = [{ type: "damaged", amount: 400, weapon: "gun", bearing: 0, by: 3 }]
+  const action = b.act(o)
+  assert.equal(b.mode, "kite")
+  assert.ok(action.move![0] < -0.4)
+  assert.equal(action.boost, true)
+})
+
 test("takes a short detour for a laser before committing to a distant drone", () => {
   const { b, o } = fixture()
   o.pickups = [{ id: 8000, kind: "laser", pos: [0, 40, 0] }]

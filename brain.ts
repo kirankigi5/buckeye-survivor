@@ -62,6 +62,9 @@ export class Brain {
   strafeFlipT = 0
   laserHoldStart = -1
   retreatUntil = -1
+  kiteUntil = -1
+  kiteDir: number[] | null = null
+  quietAfter = -1
   retreatSpot: number[] | null = null
   retreatSpotT = -100
   retreatHp = 0.6
@@ -772,12 +775,29 @@ export class Brain {
     }
     if (retreatNow) this.retreatUntil = t + 2.5
     const retreat = t < this.retreatUntil && z.next_radius > 30 && !(target && target.hp / target.maxHp < 0.15 && hasLos(target))
+    const losingTrade = taken6 > dealt6 * 1.7 + 160 || hpFrac < 0.36
+    if (losingTrade && !zoneUrgent) {
+      const hits = this.threatBearings.filter((b) => b.kind === "damage" && t - b.t < 2.6)
+      let sx = 0, sy = 0
+      for (const h of hits) { sx -= Math.cos(h.bearing); sy -= Math.sin(h.bearing) }
+      if (sx === 0 && sy === 0 && target) { sx = p[0] - target.pos[0]; sy = p[1] - target.pos[1] }
+      const L = Math.hypot(sx, sy)
+      if (L > 0.2) {
+        this.kiteDir = [sx / L, sy / L]
+        this.kiteUntil = t + 1.8
+        this.quietAfter = t + 4.4
+      }
+    }
 
     if (zoneUrgent && !(fightTarget && !outsideNow && tOut > needT * 1.2 + 3)) {
       this.mode = "zone"
       moveDir = this.navTo(obs, safePt, inCombat ? [] : avoid)
       const threatClose = mechs.some((e) => d2(e.pos, p) < 160)
       boost = (outsideNow && (z.dps >= 35 || needT > 3)) || needT * 1.15 + 2 > tOut || (me.energy > 90 && needT > 6 && !threatClose)
+    } else if (t < this.kiteUntil && this.kiteDir) {
+      this.mode = "kite"
+      moveDir = this.freeDir(p, this.kiteDir)
+      boost = me.energy > 12
     } else if (equipGoal && !retreat) {
       this.mode = "equip"
       moveDir = this.navTo(obs, equipGoal.pos, avoid)
@@ -1028,6 +1048,13 @@ export class Brain {
       }
     }
 
+    if (t >= this.kiteUntil && t < this.quietAfter && !zoneUrgent && this.mode !== "fight" && this.mode !== "retreat") {
+      const l = Math.hypot(moveDir[0], moveDir[1])
+      const cap = 4.2 / walk
+      if (l > cap) moveDir = [(moveDir[0] / l) * cap, (moveDir[1] / l) * cap]
+      boost = false
+    }
+
     if (OPT.stealth && !zoneUrgent && !fightTarget && !recentlyHit && (this.mode === "hold" || this.mode === "loot" || this.mode === "cube")) {
       const heard = this.threatBearings.some((b) => t - b.t < 8 && b.kind !== "damage")
       const known = mechs.some((e) => d2(e.pos, p) < 170)
@@ -1137,7 +1164,7 @@ export class Brain {
     {
       // keep an energy reserve for lightning and emergencies unless the zone is eating us
       const reserve = ltg ? 45 : 30
-      const emergency = outsideNow || this.mode === "retreat" || (fightTarget?.charging ?? false) || t < this.stuckUntil
+      const emergency = outsideNow || this.mode === "retreat" || this.mode === "kite" || (fightTarget?.charging ?? false) || t < this.stuckUntil
       if (boost && me.energy < reserve && !emergency) boost = false
     }
     act.boost = boost && Math.hypot(moveDir[0], moveDir[1]) > 0.3
