@@ -4,6 +4,7 @@ import { World } from "./world.ts"
 
 const env = (globalThis as any).process?.env ?? {}
 export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0" }
+export const FIRE_CONTROL = { duelEvasion: env.MF_DUEL_EVASION === "1" }
 const TAU = Math.PI * 2
 const wrap = (a: number) => {
   a = (a + Math.PI) % TAU
@@ -270,6 +271,125 @@ export class Brain {
       }
     }
     return dir
+  }
+
+  dodgeRounds(obs: Observation, course: number[], running: boolean, mayRun: boolean, zoneTight: boolean): { move: number[]; boost: boolean } | null {
+    const me = obs.self
+    const stats = me.stats
+    const p = me.pos
+    const w = this.world
+    const scale = this.scale(me.cubes)
+    const radius = (this.cfg.mech.radius ?? 2.5) * scale + 0.35
+    const height = (this.cfg.mech.height ?? 9) * scale
+    const dt = 1 / (this.cfg.match.tick_hz ?? 20)
+    const look = 0.45
+    const ticks = Math.ceil(look / dt)
+    const maxMove = Math.max(stats.boost_speed ?? 19.5, Math.hypot(me.vel[0], me.vel[1]))
+    const threats = []
+    for (const round of obs.projectiles) {
+      if (round.kind === "mortar") continue
+      const rx = round.pos[0] - p[0], ry = round.pos[1] - p[1]
+      const [vx, vy, vz] = round.vel
+      const speed2 = vx * vx + vy * vy
+      if (speed2 < 1) continue
+      const arrival = -(rx * vx + ry * vy) / speed2
+      const reach = radius + maxMove * look
+      const travel = reach / Math.sqrt(speed2)
+      if (arrival < -travel || arrival > look + travel ||
+          Math.abs(rx * vy - ry * vx) > reach * Math.sqrt(speed2)) continue
+      const heightAtArrival = round.pos[2] + vz * arrival - p[2]
+      const heightSlack = 2 + Math.abs(me.vel[2]) * look
+      if (heightAtArrival < -heightSlack || heightAtArrival > height + heightSlack) continue
+      const end = Math.min(ticks * dt, Math.max(0, arrival + travel))
+      const stop = w?.segHit(round.pos, [round.pos[0] + vx * end, round.pos[1] + vy * end, round.pos[2] + vz * end]) ?? -1
+      if (stop >= 0 && stop * end < arrival - travel) continue
+      const damage = round.kind === "gun" ? (this.cfg.weapons.gun.damage ?? 45) : (this.cfg.npc.damage ?? 25)
+      threats.push({ round, arrival, end: stop >= 0 ? stop * end : end, damage })
+    }
+    if (!threats.length) return null
+    threats.sort((a, b) => a.arrival - b.arrival)
+    threats.length = Math.min(10, threats.length)
+    const charging = me.weapons.some((weapon) => weapon?.kind === "laser" && (weapon.charge ?? 0) > 0)
+    const walk = (stats.walk_speed ?? 11.7) * (charging ? (this.cfg.mech.charge_move_mult ?? 0.5) : 1)
+    const sprint = (stats.boost_speed ?? 19.5) * (charging ? (this.cfg.mech.charge_move_mult ?? 0.5) : 1)
+    const limit = (me.grounded ? this.cfg.mech.ground_accel ?? 58.5 : this.cfg.mech.air_accel ?? 12) * dt
+    const free = (x: number, y: number, z: number) => {
+      if (!w) return true
+      const index = w.cellOf(x, y)
+      return index >= 0 && !w.blocked[index] && w.clear[index] >= 1.6 * scale &&
+        w.surf[index] - z <= (this.cfg.mech.step_up ?? 1.2) + 0.3
+    }
+    const courseLen = Math.max(1, Math.hypot(course[0], course[1]))
+    const cx = course[0] / courseLen, cy = course[1] / courseLen
+    const risk = (mx: number, my: number, boost: boolean, penalty: number) => {
+      const targetSpeed = boost && me.grounded ? sprint : walk
+      let [x, y, z] = p
+      let [vx, vy, vz] = me.vel
+      let grounded = me.grounded
+      let blocked = 0
+      const close = new Float64Array(threats.length).fill(Infinity)
+      for (let step = 1; step <= ticks; step++) {
+        vx += clamp(mx * targetSpeed - vx, -limit, limit)
+        vy += clamp(my * targetSpeed - vy, -limit, limit)
+        let nx = x + vx * dt, ny = y + vy * dt
+        if (!free(nx, ny, z)) {
+          blocked++
+          if (free(nx, y, z)) { ny = y; vy = 0 }
+          else if (free(x, ny, z)) { nx = x; vx = 0 }
+          else { nx = x; ny = y; vx = 0; vy = 0 }
+        }
+        x = nx; y = ny
+        const surface = w?.surf[w.cellOf(x, y)] ?? z
+        if (grounded && surface >= z - 0.6) z = surface
+        else {
+          grounded = false
+          vz -= (this.cfg.mech.gravity ?? 22) * dt
+          if (boost) vz = Math.min(this.cfg.mech.max_rise_speed ?? 10, vz + (this.cfg.mech.jet_accel ?? 34) * dt)
+          z += vz * dt
+          if (z <= surface) { z = surface; vz = 0; grounded = true }
+        }
+        const from = (step - 1) * dt
+        for (let i = 0; i < threats.length; i++) {
+          const { round, end } = threats[i]
+          if (from >= end) continue
+          const [dx, dy, dz] = round.vel
+          const rx = round.pos[0] - x, ry = round.pos[1] - y
+          const nearest = clamp(-(rx * dx + ry * dy) / (dx * dx + dy * dy), from, Math.min(step * dt, end))
+          const rz = round.pos[2] + dz * nearest
+          if (rz < z - 0.35 || rz > z + height + 0.35) continue
+          const sx = rx + dx * nearest, sy = ry + dy * nearest
+          close[i] = Math.min(close[i], sx * sx + sy * sy)
+        }
+      }
+      let total = penalty + blocked * 0.015
+      for (let i = 0; i < threats.length; i++) {
+        const near = clamp((radius + 0.6 - Math.sqrt(close[i])) / 1.5, 0, 1)
+        total += near * near * threats[i].damage / 45
+      }
+      return total
+    }
+    const baseline = risk(cx, cy, running, 0)
+    if (baseline < 0.2) return null
+    let best: { move: number[]; boost: boolean } | null = null
+    let lowest = baseline - 0.12
+    const [vx, vy] = threats[0].round.vel
+    const side = Math.atan2(vy, vx) + Math.PI / 2
+    const forward = Math.atan2(cy, cx)
+    const directions = [forward, side, side + Math.PI, forward + 0.8, forward - 0.8, forward + 1.6, forward - 1.6]
+    for (const angle of directions) {
+      const x = Math.cos(angle), y = Math.sin(angle)
+      const alignment = Math.max(0, Math.hypot(cx, cy) - x * cx - y * cy)
+      if (zoneTight && alignment > 1) continue
+      const directionCost = alignment * (zoneTight ? 0.43 : 0.14)
+      for (const boost of mayRun && !running ? [false, true] : [running]) {
+        const value = risk(x, y, boost, directionCost + (boost && !running ? 0.12 : 0))
+        if (value < lowest) {
+          lowest = value
+          best = { move: [x, y], boost }
+        }
+      }
+    }
+    return best
   }
 
   concealCache = new Map<number, number>()
@@ -1007,6 +1127,9 @@ export class Brain {
     }
 
     // ---- dodge projectiles
+    const nearbyShooters = mechs.filter((enemy) => d2(enemy.pos, p) < 135).length
+    const incomingShooters = new Set(this.taken.filter((hit) => (hit.by ?? -1) >= 0 && (hit.by ?? -1) < 16 && t - hit.t < 2.5).map((hit) => hit.by)).size
+    const useDuelEvasion = FIRE_CONTROL.duelEvasion && OPT.predictDodge && nearbyShooters <= 1 && incomingShooters <= 1 && this.left() > 0.4
     let dodge: { time: number; direction: number[] } | null = null
     let mortarDodge = false
     for (const pr of obs.projectiles) {
@@ -1025,7 +1148,7 @@ export class Brain {
           boost = me.energy > 5
           mortarDodge = true
         }
-      } else {
+      } else if (!useDuelEvasion) {
         const rx = pr.pos[0] - p[0], ry = pr.pos[1] - p[1]
         const vx = pr.vel[0] - (OPT.predictDodge ? me.vel[0] : 0)
         const vy = pr.vel[1] - (OPT.predictDodge ? me.vel[1] : 0)
@@ -1050,6 +1173,14 @@ export class Brain {
           }
         }
       }
+    }
+    if (useDuelEvasion && !mortarDodge && obs.projectiles.length) {
+      const reserve = ltg ? 45 : 30
+      const emergency = outsideNow || this.mode === "retreat" || (fightTarget?.charging ?? false)
+      const mayRun = me.grounded && me.energy >= Math.max(emergency ? 0 : reserve, 10)
+      const running = boost && (me.energy >= reserve || emergency)
+      const plan = this.dodgeRounds(obs, moveDir, running, mayRun, zoneUrgent)
+      if (plan) { moveDir = plan.move; boost = plan.boost }
     }
     if (dodge && !mortarDodge) {
       const keepCourse = outsideNow ? 0.8 : 0.35

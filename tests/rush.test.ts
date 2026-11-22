@@ -1,7 +1,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
-import { Brain, OPT } from "../brain.ts"
+import { Brain, FIRE_CONTROL, OPT } from "../brain.ts"
 
 const fixtureData = JSON.parse(readFileSync(new URL("./fixture.json", import.meta.url), "utf8"))
 const hello = fixtureData.hello
@@ -142,4 +142,36 @@ test("uses the most imminent shot when two shots call for opposite moves", () =>
     { id: 2, kind: "gun", pos: [95, -1, 4], vel: [-252, 0, 0] },
   ]
   assert.ok(b.act(o).move![1] < -0.9)
+}))
+
+
+test("uses predicted braking to ignore a shot outside the planned path", () => usePredictiveDodge(() => {
+  const { b, o } = fixture()
+  o.mechs = []
+  o.self.vel = [0, 11, 0]
+  o.projectiles = [{ id: 1, kind: "gun", pos: [100, 4.4, 4], vel: [-252, 0, 0] }]
+  const previous = FIRE_CONTROL.duelEvasion
+  FIRE_CONTROL.duelEvasion = true
+  try {
+    assert.deepEqual(b.act(o).move, [0, 0])
+    const revised = b.dodgeRounds(o, [0, 1], false, true, false)
+    assert.ok(revised && revised.move[1] < 0.1)
+  } finally {
+    FIRE_CONTROL.duelEvasion = previous
+  }
+}))
+
+test("keeps the original evasion when multiple mechs can join a fight", () => usePredictiveDodge(() => {
+  const { b, o } = fixture()
+  o.mechs = [2, 3].map((id) => ({ id, kind: "mech", pos: [110, id * 10, 0], vel: [0, 0, 0], aim: [0, 0], hp: 1400, max_hp: 1400 }))
+  o.projectiles = [{ id: 1, kind: "gun", pos: [50, 1, 4], vel: [-252, 0, 0] }]
+  const previous = FIRE_CONTROL.duelEvasion
+  FIRE_CONTROL.duelEvasion = true
+  try {
+    b.dodgeRounds = () => { throw new Error("Expected original crowded-fight evasion") }
+    assert.ok(b.act(o).move![1] < -0.9)
+    assert.equal(b.errors, 0)
+  } finally {
+    FIRE_CONTROL.duelEvasion = previous
+  }
 }))
