@@ -3,7 +3,7 @@ import type { ActorObs, BotAction, Hello, Observation, PickupObs, SelfObs, Weapo
 import { World } from "./world.ts"
 
 const env = (globalThis as any).process?.env ?? {}
-export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0", finish: env.MF_FINISH === "1", recover: env.MF_RECOVER === "1", seek: env.MF_SEEK === "1", arc: env.MF_ARC === "1", aimRange: env.MF_AIMRANGE === "1", plan: env.MF_PLAN === "1", rank: env.MF_RANK === "1", commitW: Number(env.MF_COMMIT_W ?? 140), commitS: Number(env.MF_COMMIT_S ?? 6), laserEarly: Number(env.MF_LASER_EARLY ?? 0.2), calmHp: Number(env.MF_CALM_HP ?? 0.88), scoop: env.MF_SCOOP === "1" }
+export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0", finish: env.MF_FINISH === "1", recover: env.MF_RECOVER === "1", seek: env.MF_SEEK === "1", arc: env.MF_ARC === "1", aimRange: env.MF_AIMRANGE === "1", plan: env.MF_PLAN === "1", rank: env.MF_RANK === "1", commitW: Number(env.MF_COMMIT_W ?? 140), commitS: Number(env.MF_COMMIT_S ?? 6), laserEarly: Number(env.MF_LASER_EARLY ?? 0.2), calmHp: Number(env.MF_CALM_HP ?? 0.88), scoop: env.MF_SCOOP === "1", antiLtg: env.MF_ANTI_LTG === "1" }
 const TAU = Math.PI * 2
 const wrap = (a: number) => {
   a = (a + Math.PI) % TAU
@@ -1023,6 +1023,17 @@ export class Brain {
         mx = -uy * sg; my = ux * sg
         boost = me.energy > 10
       }
+      // keep every visible lightning carrier outside its reach, not just the target
+      if (OPT.antiLtg) {
+        const reach = (this.cfg.weapons.lightning?.range ?? 45) + 12
+        for (const o of mechs) {
+          if (t - o.seen > 1.5 || !o.weapons.includes("lightning") || (ltg && o.id === e.id)) continue
+          const od = d2(o.pos, p)
+          if (od >= reach || od < 0.5) continue
+          const w = (reach - od) / reach * 1.6
+          mx += ((p[0] - o.pos[0]) / od) * w; my += ((p[1] - o.pos[1]) / od) * w
+        }
+      }
       // stay in the zone
       if (d2(p, safeC) > safeR && z.next_radius > 0) {
         const zx = safeC[0] - p[0], zy = safeC[1] - p[1], zl = Math.hypot(zx, zy) || 1
@@ -1061,9 +1072,9 @@ export class Brain {
       }
       // A kill can drop several cubes. Collect them before leaving for a pickup.
       const kill = this.lastKill
-      const scoopOk = !kill ? false : OPT.scoop ? hpFrac > 0.3 && !mechs.some((e) => d2(e.pos, p) < 40) && t - kill!.t < 12 : ![...this.attackers.values()].some((a) => t - a.t < 2.5) && !mechs.some((e) => d2(e.pos, p) < 75) && t - kill!.t < 8
+      const scoopOk = !kill ? false : OPT.scoop ? hpFrac > 0.3 && !mechs.some((e) => d2(e.pos, p) < 40) && t - kill!.t < 20 : ![...this.attackers.values()].some((a) => t - a.t < 2.5) && !mechs.some((e) => d2(e.pos, p) < 75) && t - kill!.t < 8
       if (kill && !goal && scoopOk) {
-        let closest = 100
+        let closest = OPT.scoop ? 180 : 100
         for (const { item: cube } of this.cubes.values()) {
           const distance = d2(p, cube.pos)
           if (distance < closest && d2(cube.pos, kill.pos) < 15 && Math.abs(cube.pos[2] - kill.pos[2]) < 4 && ptOk(cube.pos)) {
@@ -1072,7 +1083,7 @@ export class Brain {
             goalKind = "kill-cubes"
           }
         }
-        if (!goal && d2(p, kill.pos) > 6 && d2(p, kill.pos) < 75 && ptOk(kill.pos)) {
+        if (!goal && d2(p, kill.pos) > 6 && d2(p, kill.pos) < (OPT.scoop ? 180 : 75) && ptOk(kill.pos)) {
           goal = kill.pos
           goalKind = "kill-cubes"
         }
