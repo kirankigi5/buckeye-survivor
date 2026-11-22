@@ -3,7 +3,7 @@ import type { ActorObs, BotAction, Hello, Observation, PickupObs, SelfObs, Weapo
 import { World } from "./world.ts"
 
 const env = (globalThis as any).process?.env ?? {}
-export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0", finish: env.MF_FINISH === "1", recover: env.MF_RECOVER === "1", seek: env.MF_SEEK === "1", arc: env.MF_ARC === "1", aimRange: env.MF_AIMRANGE === "1", plan: env.MF_PLAN === "1" }
+export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0", finish: env.MF_FINISH === "1", recover: env.MF_RECOVER === "1", seek: env.MF_SEEK === "1", arc: env.MF_ARC === "1", aimRange: env.MF_AIMRANGE === "1", plan: env.MF_PLAN === "1", rank: env.MF_RANK === "1" }
 const TAU = Math.PI * 2
 const wrap = (a: number) => {
   a = (a + Math.PI) % TAU
@@ -672,7 +672,7 @@ export class Brain {
       if (OPT.finish && !engage && eFrac < 0.45 && hpFrac > 0.4 && dd < 220) engage = true
       if (!engage) continue
       const recentDmg = this.taken.reduce((a, x) => a + (x.by === e.id && t - x.t < 3 ? x.a : 0), 0)
-      let s = dd + e.hp / 12 - recentDmg / 3 - (attacker ? 60 : 0) - (e.id === this.lastTargetId && t - this.lastTargetT < 3 ? 70 : 0) + (los ? 0 : 80) - (OPT.finish ? (1 - eFrac) * 120 : 0) - (OPT.arc ? this.exposure(e, p, !!laser) : 0)
+      let s = dd + e.hp / 12 - recentDmg / 3 - (attacker ? 60 : 0) - (e.id === this.lastTargetId && t - this.lastTargetT < 3 ? 70 : 0) - (OPT.rank && e.id === this.lastTargetId && t - (this.hitT.get(e.id) ?? -99) < 5 ? 120 + (1 - eFrac) * 120 : 0) + (los ? 0 : 80) - (OPT.finish ? (1 - eFrac) * 120 : 0) - (OPT.arc ? this.exposure(e, p, !!laser) : 0)
       if (s < bestScore) { bestScore = s; target = e }
     }
     // NPC that is shooting us or that we can farm
@@ -1310,7 +1310,11 @@ export class Brain {
       else if (laser && los) primary = "laser"
       else if (gun && los) primary = "gun"
 
-      if (primary === "lightning" || primary === "laser" || primary === "none") {
+      const laserNearRelease = !!laser && (laser.charge ?? 0) >= (laser.stats.charge ?? 0.75) - 0.15
+      if (OPT.rank && gunOk && los && (primary === "lightning" || (primary === "laser" && !laserNearRelease))) {
+        // the lightning cone and an early laser charge tolerate the gun's lead, so both slots shoot
+        aim = this.aimAt(muzzle, this.leadPoint(muzzle, e, gunSpeed, 0.05))
+      } else if (primary === "lightning" || primary === "laser" || primary === "none") {
         const lead = this.leadPoint(muzzle, e, 1e9, 0.08)
         aim = this.aimAt(muzzle, lead)
       } else if (primary === "gun") {
@@ -1358,8 +1362,11 @@ export class Brain {
           const ready = charge >= full - 0.06
           const on = los && this.onTarget(me, muzzle, lead, hw * 0.9, hh)
           // release (fire) when fully charged and on target
-          if (ready && on) fire[laserSlot] = false
-          else if (t - this.laserHoldStart > full + 1.6) fire[laserSlot] = false
+          const minFrac = laser.stats.min_frac ?? 0.35, base = laser.stats.damage ?? 315
+          const dmgNow = base * (minFrac + (1 - minFrac) * Math.min(1, charge / full)) * (1 + 0.04 * Math.min(me.cubes, 10)) * (e.weapons.includes("mortar") ? 1.6 : 1)
+          const lethal = OPT.rank && !e.npc && on && charge >= (laser.stats.min_charge ?? 0.15) && dmgNow >= e.hp
+          if ((ready && on) || lethal) fire[laserSlot] = false
+          else if (t - this.laserHoldStart > full + (OPT.rank && los ? 1.9 : 1.6)) fire[laserSlot] = false
           else fire[laserSlot] = true
         } else {
           this.laserHoldStart = -1
@@ -1369,7 +1376,7 @@ export class Brain {
     } else {
       if (!(laser && (laser.charge ?? 0) > 0)) this.laserHoldStart = -1
       // shoot crates for loot when it is calm
-      const calm = this.mode !== "recover" && this.mode !== "rush" && this.mode !== "equip" && (OPT.farm || !OPT.stealth) && !mechThreatNear && t - this.lastDamageT > 6 && !zoneUrgent
+      const calm = !(OPT.rank && hpFrac < 0.9) && this.mode !== "recover" && this.mode !== "rush" && this.mode !== "equip" && (OPT.farm || !OPT.stealth) && !mechThreatNear && t - this.lastDamageT > 6 && !zoneUrgent
       if (calm && ((gun && gunOk) || (ltg && me.energy > 40))) {
         let best: { id: number; pos: number[]; hp: number } | null = null, bd = OPT.farm ? 90 : 70
         for (const [, m] of this.crates) {
