@@ -3,7 +3,7 @@ import type { ActorObs, BotAction, Hello, Observation, PickupObs, SelfObs, Weapo
 import { World } from "./world.ts"
 
 const env = (globalThis as any).process?.env ?? {}
-export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1" }
+export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0" }
 const TAU = Math.PI * 2
 const wrap = (a: number) => {
   a = (a + Math.PI) % TAU
@@ -153,7 +153,7 @@ export class Brain {
       }
       this.enemies.set(m.id, e)
     }
-    for (const [id, e] of this.enemies) if (t - e.seen > 12) this.enemies.delete(id)
+    for (const [id, e] of this.enemies) if (t - e.seen > (e.npc ? 40 : 12)) this.enemies.delete(id)
     for (const p of obs.pickups) this.pickups.set(p.id, { item: p, seen: t })
     for (const c of obs.cubes) this.cubes.set(c.id, { item: c, seen: t })
     for (const c of obs.crates) this.crates.set(c.id, { item: { id: c.id, pos: c.pos, hp: c.hp ?? 300 }, seen: t })
@@ -570,7 +570,7 @@ export class Brain {
       for (const e of npcs) {
         const dd = d2(e.pos, p)
         const attacker = this.attackers.has(e.id) && t - this.attackers.get(e.id)!.t < 4
-        const farm = !OPT.stealth && !mechThreatNear && hpFrac > 0.55 && dd < 90 && (gunOk || ltg || laser) && !zoneUrgent
+        const farm = (OPT.farm || !OPT.stealth) && !mechThreatNear && hpFrac > (OPT.farm ? 0.45 : 0.55) && dd < (OPT.farm ? 130 : 90) && (gunOk || ltg || laser || (gun && hpFrac > 0.7)) && !zoneUrgent
         if ((attacker || farm) && visibleNow.has(e.id) && hasLos(e) && dd < bd) { bd = dd; npcTarget = e }
       }
     }
@@ -746,11 +746,35 @@ export class Brain {
       // cubes
       if (!goal) {
         let bd = 120
+        if (OPT.farm) bd = 170
         for (const [, m] of this.cubes) {
           const c = m.item
           const dd = d2(c.pos, p)
           if (Math.abs(c.pos[2] - (this.world?.ground(c.pos[0], c.pos[1]) ?? c.pos[2])) > 2) continue
           if (dd < bd && ptOk(c.pos)) { bd = dd; goal = [c.pos[0], c.pos[1]]; goalKind = "cube" }
+        }
+      }
+      if (OPT.farm && !goal && !mechThreatNear && hpFrac > 0.5 && !zoneUrgent) {
+        // hunt remembered drones, then crates
+        let bd = 220
+        for (const e of this.enemies.values()) {
+          if (!e.npc || t - e.seen > 40) continue
+          const dd = d2(e.pos, p)
+          if (dd < bd && ptOk(e.pos)) { bd = dd; goal = [e.pos[0], e.pos[1]]; goalKind = "hunt" }
+        }
+        if (!goal) {
+          let bc = 170
+          for (const [, m] of this.crates) {
+            const c = m.item
+            if (Math.abs(c.pos[2] - (this.world?.ground(c.pos[0], c.pos[1]) ?? c.pos[2])) > 2) continue
+            const dd = d2(c.pos, p)
+            if (dd < bc && ptOk(c.pos)) { bc = dd; goal = [c.pos[0], c.pos[1]]; goalKind = "crate" }
+          }
+          // stop at shooting distance with line of sight
+          if (goal && goalKind === "crate" && d2(goal, p) < 40) {
+            const cp = [goal[0], goal[1], (this.world?.ground(goal[0], goal[1]) ?? p[2]) + 1.2]
+            if (this.los(muzzle, cp)) goal = [p[0], p[1]]
+          }
         }
       }
       if (goal && safeTime < 5) goal = null
@@ -968,9 +992,9 @@ export class Brain {
     } else {
       if (!(laser && (laser.charge ?? 0) > 0)) this.laserHoldStart = -1
       // shoot crates for loot when it is calm
-      const calm = !OPT.stealth && !mechThreatNear && t - this.lastDamageT > 6 && !zoneUrgent
-      if (calm && gun && gunOk) {
-        let best: { id: number; pos: number[]; hp: number } | null = null, bd = 70
+      const calm = (OPT.farm || !OPT.stealth) && !mechThreatNear && t - this.lastDamageT > 6 && !zoneUrgent
+      if (calm && ((gun && gunOk) || (ltg && me.energy > 40))) {
+        let best: { id: number; pos: number[]; hp: number } | null = null, bd = OPT.farm ? 90 : 70
         for (const [, m] of this.crates) {
           if (m.seen < t) continue
           const dd = d2(m.item.pos, p)
@@ -983,7 +1007,8 @@ export class Brain {
         if (best) {
           const cp = [best.pos[0], best.pos[1], best.pos[2] + 1.2]
           aim = this.aimAt(muzzle, cp)
-          if (gun.cooldown <= 0.1 && this.onTarget(me, muzzle, cp, 1.0, 1.0)) fire[gunSlot] = true
+          if (gun && gunOk && gun.cooldown <= 0.1 && this.onTarget(me, muzzle, cp, 1.0, 1.0)) fire[gunSlot] = true
+          if (ltg && bd < (ltg.stats.range ?? 45) * 0.9 && Math.abs(angDiff(me.aim[0], aim[0])) < 0.2) fire[ltgSlot] = true
           this.mode += "+crate"
         }
       }
