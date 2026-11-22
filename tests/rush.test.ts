@@ -112,3 +112,34 @@ test("clears the defeated attacker and moves to its dropped cubes", () => {
   assert.ok(action.move![0] > 0.9)
   assert.deepEqual(action.fire, [false, false])
 })
+
+function usePredictiveDodge(run: () => void) {
+  const previous = OPT.predictDodge
+  OPT.predictDodge = true
+  try { run() } finally { OPT.predictDodge = previous }
+}
+
+test("ignores shots above the mech", () => usePredictiveDodge(() => {
+  const { b, o } = fixture()
+  o.mechs = []
+  o.projectiles = [{ id: 1, kind: "gun", pos: [50, 1, 20], vel: [-252, 0, 0] }]
+  assert.deepEqual(b.act(o).move, [0, 0])
+}))
+
+test("dodges a shot that intersects the mech's current movement", () => usePredictiveDodge(() => {
+  const { b, o } = fixture()
+  o.mechs = []
+  o.self.vel = [0, 11, 0]
+  o.projectiles = [{ id: 1, kind: "gun", pos: [100, 4.4, 4], vel: [-252, 0, 0] }]
+  assert.ok(Math.abs(b.act(o).move![1]) > 0.9)
+}))
+
+test("uses the most imminent shot when two shots call for opposite moves", () => usePredictiveDodge(() => {
+  const { b, o } = fixture()
+  o.mechs = []
+  o.projectiles = [
+    { id: 1, kind: "gun", pos: [50, 1, 4], vel: [-252, 0, 0] },
+    { id: 2, kind: "gun", pos: [95, -1, 4], vel: [-252, 0, 0] },
+  ]
+  assert.ok(b.act(o).move![1] < -0.9)
+}))

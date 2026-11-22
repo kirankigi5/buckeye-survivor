@@ -3,7 +3,7 @@ import type { ActorObs, BotAction, Hello, Observation, PickupObs, SelfObs, Weapo
 import { World } from "./world.ts"
 
 const env = (globalThis as any).process?.env ?? {}
-export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0" }
+export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0" }
 const TAU = Math.PI * 2
 const wrap = (a: number) => {
   a = (a + Math.PI) % TAU
@@ -1007,6 +1007,8 @@ export class Brain {
     }
 
     // ---- dodge projectiles
+    let dodge: { time: number; direction: number[] } | null = null
+    let mortarDodge = false
     for (const pr of obs.projectiles) {
       if (pr.kind === "mortar") {
         // predict landing
@@ -1021,10 +1023,12 @@ export class Brain {
           const dx = p[0] - lp[0], dy = p[1] - lp[1], L = Math.hypot(dx, dy) || 1
           moveDir = this.freeDir(p, [dx / L, dy / L])
           boost = me.energy > 5
+          mortarDodge = true
         }
       } else {
         const rx = pr.pos[0] - p[0], ry = pr.pos[1] - p[1]
-        const vx = pr.vel[0], vy = pr.vel[1]
+        const vx = pr.vel[0] - (OPT.predictDodge ? me.vel[0] : 0)
+        const vy = pr.vel[1] - (OPT.predictDodge ? me.vel[1] : 0)
         const vv = vx * vx + vy * vy
         if (vv < 1) continue
         const tca = -(rx * vx + ry * vy) / vv
@@ -1032,13 +1036,25 @@ export class Brain {
         const cx = rx + vx * tca, cy = ry + vy * tca
         const miss = Math.hypot(cx, cy)
         if (miss < 3 * sc && tca > 0.12) {
+          if (OPT.predictDodge) {
+            const height = pr.pos[2] - p[2] + (pr.vel[2] - me.vel[2]) * tca
+            if (height < -0.5 || height > 9 * sc + 0.5 || tca > 0.5 || (dodge && tca > dodge.time)) continue
+          }
           const vl = Math.sqrt(vv)
           let nx = -vy / vl, ny = vx / vl
           if (nx * cx + ny * cy > 0) { nx = -nx; ny = -ny }
-          const dir = this.freeDir(p, [nx, ny])
-          moveDir = [moveDir[0] * 0.3 + dir[0], moveDir[1] * 0.3 + dir[1]]
+          if (OPT.predictDodge) dodge = { time: tca, direction: [nx, ny] }
+          else {
+            const dir = this.freeDir(p, [nx, ny])
+            moveDir = [moveDir[0] * 0.3 + dir[0], moveDir[1] * 0.3 + dir[1]]
+          }
         }
       }
+    }
+    if (dodge && !mortarDodge) {
+      const keepCourse = outsideNow ? 0.8 : 0.35
+      const [x, y] = this.freeDir(p, dodge.direction)
+      moveDir = [moveDir[0] * keepCourse + x, moveDir[1] * keepCourse + y]
     }
 
     // ---- stuck handling
