@@ -257,3 +257,37 @@ test("uses the most imminent shot when two shots call for opposite moves", () =>
   ]
   assert.ok(b.act(o).move![1] < -0.9)
 }))
+
+function chooseUpgrade(ids: string[], adjust?: (o: any) => void) {
+  const { b, o } = fixture()
+  adjust?.(o)
+  o.offer = { id: 1, expires: 5, choices: ids.map((id) => ({ id, name: id, desc: "" })) }
+  return ids[b.act(o).pick!]
+}
+
+test("chooses the first magazine upgrade over raw gun damage when it provides more sustained output", () => {
+  assert.equal(chooseUpgrade(["gun_damage", "gun_mag", "gun_rate"]), "gun_mag")
+})
+
+test("reevaluates a second magazine upgrade using the current magazine and reload stats", () => {
+  const choice = chooseUpgrade(["gun_mag", "gun_damage"], (o) => {
+    Object.assign(o.self.weapons[0].stats, { mag: 20, reload: 1.92 })
+  })
+  assert.equal(choice, "gun_damage")
+})
+
+test("compares plating with armor using effective health", () => {
+  assert.equal(chooseUpgrade(["armor", "plating"]), "plating")
+})
+
+test("deprioritizes an upgrade for a weapon dropped before the offer was answered", () => {
+  const choice = chooseUpgrade(["gun_mag", "plating"], (o) => { o.self.weapons[0] = null })
+  assert.equal(choice, "plating")
+})
+
+test("weights weapon upgrades by the damage share of the equipped pair", () => {
+  const choice = chooseUpgrade(["gun_mag", "laser_damage"], (o) => {
+    o.self.weapons[1] = { kind: "laser", cooldown: 0, charge: 0, stats: hello.config.weapons.laser }
+  })
+  assert.equal(choice, "laser_damage")
+})
