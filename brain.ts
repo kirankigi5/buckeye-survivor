@@ -614,7 +614,8 @@ export class Brain {
       for (const e of npcs) {
         const dd = d2(e.pos, p)
         const attacker = this.attackers.has(e.id) && t - this.attackers.get(e.id)!.t < 4
-        const farm = !lateCaution && (OPT.farm || !OPT.stealth) && !mechThreatNear && hpFrac > (OPT.farm ? 0.45 : 0.55) && dd < (OPT.farm ? 130 : 90) && (gunOk || ltg || laser || (gun && hpFrac > 0.7)) && !zoneUrgent
+        const farmSafe = !mechs.some((o) => d2(o.pos, p) < 82)
+        const farm = !lateCaution && farmSafe && (OPT.farm || !OPT.stealth) && hpFrac > (OPT.farm ? 0.45 : 0.55) && dd < 36 && (gunOk || ltg || laser || (gun && hpFrac > 0.7)) && !zoneUrgent
         if ((attacker || farm) && visibleNow.has(e.id) && hasLos(e) && dd < bd) { bd = dd; npcTarget = e }
       }
     }
@@ -950,16 +951,16 @@ export class Brain {
           if (dd < bd && ptOk(c.pos)) { bd = dd; goal = [c.pos[0], c.pos[1]]; goalKind = "cube" }
         }
       }
-      if (OPT.farm && !goal && !mechThreatNear && hpFrac > 0.5 && !zoneUrgent) {
-        // hunt remembered drones, then crates
-        let bd = 220
+      if (OPT.farm && !goal && !mechs.some((o) => d2(o.pos, p) < 82) && hpFrac > 0.5 && !zoneUrgent) {
+        // only a drone or crate that is already nearby
+        let bd = 44
         for (const e of this.enemies.values()) {
           if (!e.npc || t - e.seen > 40) continue
           const dd = d2(e.pos, p)
           if (dd < bd && ptOk(e.pos)) { bd = dd; goal = [e.pos[0], e.pos[1]]; goalKind = "hunt" }
         }
         if (!goal) {
-          let bc = 170
+          let bc = 40
           for (const [, m] of this.crates) {
             const c = m.item
             if (Math.abs(c.pos[2] - (this.world?.ground(c.pos[0], c.pos[1]) ?? c.pos[2])) > 2) continue
@@ -1028,15 +1029,16 @@ export class Brain {
       }
     }
 
-    if (OPT.stealth && !zoneUrgent && !fightTarget && !recentlyHit && (this.mode === "hold" || this.mode === "loot" || this.mode === "cube")) {
-      const heard = this.threatBearings.some((b) => t - b.t < 8 && b.kind !== "damage")
-      const known = mechs.some((e) => d2(e.pos, p) < 170)
-      if (heard || known) {
-        const l = Math.hypot(moveDir[0], moveDir[1])
-        const cap = 4.4 / walk
-        if (l > cap) moveDir = [(moveDir[0] / l) * cap, (moveDir[1] / l) * cap]
-        boost = false
-      }
+    const npcClose = npcs.some((e) => d2(e.pos, p) < 46)
+    const mechClose = mechs.some((e) => d2(e.pos, p) < 82)
+    const calmWalk = !zoneUrgent && !fightTarget && !recentlyHit && !npcClose && !mechClose
+      && (this.mode === "hold" || this.mode === "loot" || this.mode === "cube")
+    if (calmWalk) {
+      const step = this.cfg.sound?.step_speed ?? 5
+      const cap = Math.max(2.4, step - 0.7) / walk
+      const l = Math.hypot(moveDir[0], moveDir[1])
+      if (l > cap) moveDir = [(moveDir[0] / l) * cap, (moveDir[1] / l) * cap]
+      boost = false
     }
 
     // ---- dodge projectiles
@@ -1251,7 +1253,7 @@ export class Brain {
       // shoot crates for loot when it is calm
       const calm = this.mode !== "rush" && this.mode !== "equip" && (OPT.farm || !OPT.stealth) && !mechThreatNear && t - this.lastDamageT > 6 && !zoneUrgent
       if (calm && ((gun && gunOk) || (ltg && me.energy > 40))) {
-        let best: { id: number; pos: number[]; hp: number } | null = null, bd = OPT.farm ? 90 : 70
+        let best: { id: number; pos: number[]; hp: number } | null = null, bd = 40
         for (const [, m] of this.crates) {
           if (m.seen < t) continue
           const dd = d2(m.item.pos, p)

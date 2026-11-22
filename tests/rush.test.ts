@@ -95,6 +95,16 @@ test("late in the match does not chase a hunter that has not shot us", () => {
   assert.notEqual(b.mode, "fight")
 })
 
+test("does not farm a drone that is not nearby", () => {
+  const { b, o } = fixture()
+  step(o, 40)
+  o.self.cubes = 2
+  o.mechs = [{ id: 100, kind: "npc", pos: [80, 0, 0], vel: [0, 0, 0], aim: [0, 0], hp: 350, max_hp: 350 }]
+  b.act(o)
+  assert.notEqual(b.mode, "npc")
+  assert.notEqual(b.mode, "hunt")
+})
+
 test("takes a short detour for a laser before committing to a distant drone", () => {
   const { b, o } = fixture()
   o.pickups = [{ id: 8000, kind: "laser", pos: [0, 40, 0] }]
