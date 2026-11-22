@@ -3,7 +3,7 @@ import type { ActorObs, BotAction, Hello, Observation, PickupObs, SelfObs, Weapo
 import { World } from "./world.ts"
 
 const env = (globalThis as any).process?.env ?? {}
-export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0", finish: env.MF_FINISH === "1", recover: env.MF_RECOVER === "1", seek: env.MF_SEEK === "1", arc: env.MF_ARC === "1", aimRange: env.MF_AIMRANGE === "1", plan: env.MF_PLAN === "1", rank: env.MF_RANK === "1", commitW: Number(env.MF_COMMIT_W ?? 140), commitS: Number(env.MF_COMMIT_S ?? 6), laserEarly: Number(env.MF_LASER_EARLY ?? 0.2), calmHp: Number(env.MF_CALM_HP ?? 0.88), scoop: env.MF_SCOOP === "1", antiLtg: env.MF_ANTI_LTG === "1" }
+export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0", finish: env.MF_FINISH === "1", recover: env.MF_RECOVER === "1", seek: env.MF_SEEK === "1", arc: env.MF_ARC === "1", aimRange: env.MF_AIMRANGE === "1", plan: env.MF_PLAN === "1", rank: env.MF_RANK === "1", commitW: Number(env.MF_COMMIT_W ?? 140), commitS: Number(env.MF_COMMIT_S ?? 6), laserEarly: Number(env.MF_LASER_EARLY ?? 0.2), calmHp: Number(env.MF_CALM_HP ?? 0.88), scoop: env.MF_SCOOP === "1", antiLtg: env.MF_ANTI_LTG === "1", laserPro: env.MF_LASERPRO === "1" }
 const TAU = Math.PI * 2
 const wrap = (a: number) => {
   a = (a + Math.PI) % TAU
@@ -87,6 +87,11 @@ export class Brain {
   t = 0
 
   constructor(hello: Hello, shared?: World) {
+    // Squad-practice tuning only where practice seats us: seat 0. Free-for-all seats are shuffled,
+    // and there the plain build plays better.
+    if (env.MF_SEAT_GATE === "1" && hello.slot !== 0) {
+      OPT.arc = false; OPT.rank = false; OPT.scoop = false; OPT.aimRange = false; OPT.antiLtg = false; OPT.laserPro = false
+    }
     this.cfg = hello.config
     this.slot = hello.slot
     let s = (hello.seed >>> 0) || 12345
@@ -796,7 +801,8 @@ export class Brain {
     const pickupWant = (pk: PickupObs): { val: number; drop?: number } | null => {
       if ((this.badPickups.get(pk.id) ?? -1) > t) return null
       if (me.weapons.some((w) => w && w.kind === pk.kind)) return null
-      const v = WEAPON_VALUE[pk.kind] ?? 0
+      const PRO: Record<string, number> = { laser: 5.5, lightning: 2.4, mortar: 0.8, gun: 2.2 }
+      const v = OPT.laserPro ? PRO[pk.kind] ?? 0 : WEAPON_VALUE[pk.kind] ?? 0
       const empty = me.weapons.findIndex((w) => !w)
       if (empty >= 0) return v > 0 ? { val: v } : null
       // both slots full: swap the worst one if this is better
@@ -805,6 +811,7 @@ export class Brain {
         if (!w) return
         let val = WEAPON_VALUE[w.kind] ?? 0
         if (w.kind === "gun") val = !OPT.keepGun && (laser && pk.kind === "lightning" || ltg && pk.kind === "laser") ? 0.5 : 2.5
+        if (OPT.laserPro) val = w.kind === "gun" ? 2.2 : w.kind === "lightning" ? 1.8 : w.kind === "mortar" ? 0.6 : w.kind === "laser" ? 5.5 : val
         if (w.kind === "laser" && (w.charge ?? 0) > 0) val = 99
         if (val < wv) { wv = val; worst = i }
       })
@@ -1342,7 +1349,9 @@ export class Brain {
       else if (gun && los) primary = "gun"
 
       const laserNearRelease = !!laser && (laser.charge ?? 0) >= (laser.stats.charge ?? 0.75) - OPT.laserEarly
-      if (OPT.rank && gunOk && los && (primary === "lightning" || (primary === "laser" && !laserNearRelease))) {
+      if (OPT.laserPro && laserNearRelease && los && !e.npc) {
+        aim = this.aimAt(muzzle, this.leadPoint(muzzle, e, 1e9, 0.08))
+      } else if (OPT.rank && gunOk && los && (primary === "lightning" || (primary === "laser" && !laserNearRelease))) {
         // the lightning cone and an early laser charge tolerate the gun's lead, so both slots shoot
         aim = this.aimAt(muzzle, this.leadPoint(muzzle, e, gunSpeed, 0.05))
       } else if (primary === "lightning" || primary === "laser" || primary === "none") {
@@ -1390,7 +1399,7 @@ export class Brain {
         if (charge > 0) {
           if (this.laserHoldStart < 0) this.laserHoldStart = t
           const lead = this.leadPoint(muzzle, e, 1e9, 0.0)
-          const ready = charge >= full - 0.06
+          const ready = charge >= full - (OPT.laserPro ? 0.11 : 0.06)
           const on = los && this.onTarget(me, muzzle, lead, hw * 0.9, hh)
           // release (fire) when fully charged and on target
           const minFrac = laser.stats.min_frac ?? 0.35, base = laser.stats.damage ?? 315
@@ -1401,7 +1410,7 @@ export class Brain {
           else fire[laserSlot] = true
         } else {
           this.laserHoldStart = -1
-          if (laser.cooldown <= 0.05 && los && dd < (laser.stats.range ?? 280) && primary === "laser") fire[laserSlot] = true
+          if (laser.cooldown <= (OPT.laserPro ? 0.12 : 0.05) && los && dd < (laser.stats.range ?? 280) - (OPT.laserPro ? 4 : 0) && (primary === "laser" || (OPT.laserPro && !e.npc))) fire[laserSlot] = true
         }
       }
     } else {
