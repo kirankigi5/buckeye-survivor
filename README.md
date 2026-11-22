@@ -20,6 +20,7 @@ A Mech Royale (`mechfight/1`) bot written in TypeScript and run with Bun. It pla
 - **Loot:** walks to weapons, cubes, and uncontested supply drops when that is safe for the zone. Shoots crates when nothing is around. Ends up with laser + lightning when it can.
 - **Combat:**
   - gun shots lead the target and fire only when the shot is lined up and not blocked;
+  - the same gun lead stays commanded while lightning is firing or a laser is charging, so the arm gun keeps shooting; the torso slews to the beam only as that charge is about to release;
   - laser charges fully and is released on target;
   - lightning fires whenever a target is in its cone;
   - mortar uses a ballistic solution and lobs over cover;

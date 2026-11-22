@@ -1118,12 +1118,20 @@ export class Brain {
       else if (laser && los) primary = "laser"
       else if (gun && los) primary = "gun"
 
-      if (primary === "lightning" || primary === "laser" || primary === "none") {
-        const lead = this.leadPoint(muzzle, e, 1e9, 0.08)
-        aim = this.aimAt(muzzle, lead)
-      } else if (primary === "gun") {
-        aim = this.aimAt(muzzle, this.leadPoint(muzzle, e, gunSpeed, 0.05))
-      } else if (primary === "mortar") {
+      // One torso. The arm gun only shoots along the actual aim, so a hitscan aim
+      // silences it for the whole laser charge and the whole lightning fight.
+      // Stay on the gun's lead while lightning is in its cone or the laser is still
+      // charging, and turn onto the beam only as the charge is about to be released.
+      const gunPoint = this.leadPoint(muzzle, e, gunSpeed, 0.05)
+      const beamPoint = this.leadPoint(muzzle, e, 1e9, 0)
+      const gunAim = this.aimAt(muzzle, gunPoint)
+      const beamAim = this.aimAt(muzzle, beamPoint)
+      const chargeNow = laser?.charge ?? 0
+      const fullCharge = laser?.stats.charge ?? 0.75
+      const slew = Math.abs(angDiff(me.aim[0], beamAim[0])) / Math.max(0.4, st.turn_rate ?? 4)
+      const handToBeam = !!laser && chargeNow > 0 && fullCharge - chargeNow <= slew + 0.08 && chargeNow >= fullCharge * 0.62
+
+      if (primary === "mortar") {
         const mv = mortar!.stats.speed ?? 72, mg = mortar!.stats.gravity ?? 22
         const mz = [p[0], p[1], p[2] + 9 * sc + 0.5]
         let tgt = [e.pos[0], e.pos[1], e.pos[2] + 1]
@@ -1144,6 +1152,12 @@ export class Brain {
         } else {
           aim = this.aimAt(muzzle, center)
         }
+      } else if (handToBeam) {
+        aim = beamAim
+      } else if (gun && (primary === "lightning" || primary === "laser" || primary === "gun" || chargeNow > 0)) {
+        aim = gunAim
+      } else {
+        aim = beamAim
       }
       // fire whatever is lined up
       if (gun && gunOk && los && dd < (gun.stats.range ?? 230)) {
