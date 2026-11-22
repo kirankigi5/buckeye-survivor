@@ -3,7 +3,7 @@ import type { ActorObs, BotAction, Hello, Observation, PickupObs, SelfObs, Weapo
 import { World } from "./world.ts"
 
 const env = (globalThis as any).process?.env ?? {}
-export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0", finish: env.MF_FINISH === "1", recover: env.MF_RECOVER === "1", seek: env.MF_SEEK === "1", arc: env.MF_ARC === "1", aimRange: env.MF_AIMRANGE === "1", plan: env.MF_PLAN === "1", rank: env.MF_RANK === "1", commitW: Number(env.MF_COMMIT_W ?? 140), commitS: Number(env.MF_COMMIT_S ?? 6), laserEarly: Number(env.MF_LASER_EARLY ?? 0.2), calmHp: Number(env.MF_CALM_HP ?? 0.88) }
+export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0", predictDodge: env.MF_PREDICT_DODGE !== "0", finish: env.MF_FINISH === "1", recover: env.MF_RECOVER === "1", seek: env.MF_SEEK === "1", arc: env.MF_ARC === "1", aimRange: env.MF_AIMRANGE === "1", plan: env.MF_PLAN === "1", rank: env.MF_RANK === "1", commitW: Number(env.MF_COMMIT_W ?? 140), commitS: Number(env.MF_COMMIT_S ?? 6), laserEarly: Number(env.MF_LASER_EARLY ?? 0.2), calmHp: Number(env.MF_CALM_HP ?? 0.88), scoop: env.MF_SCOOP === "1" }
 const TAU = Math.PI * 2
 const wrap = (a: number) => {
   a = (a + Math.PI) % TAU
@@ -281,6 +281,10 @@ export class Brain {
       } else if (ev.type === "kill" && OPT.collectKill) {
         const enemy = this.enemies.get(ev.target)
         if (enemy) this.lastKill = { pos: enemy.pos, t }
+        if (OPT.scoop && !this.taken.some((x) => x.by !== ev.target && t - x.t < 2.5)) {
+          this.retreatUntil = -1
+          this.threatBearings = this.threatBearings.filter((b) => b.kind !== "damage" || t - b.t > 3)
+        }
         this.enemies.delete(ev.target)
         this.attackers.delete(ev.target)
         this.taken = this.taken.filter((hit) => hit.by !== ev.target)
@@ -1057,7 +1061,8 @@ export class Brain {
       }
       // A kill can drop several cubes. Collect them before leaving for a pickup.
       const kill = this.lastKill
-      if (kill && !goal && t - kill.t < 8 && ![...this.attackers.values()].some((a) => t - a.t < 2.5) && !mechs.some((e) => d2(e.pos, p) < 75)) {
+      const scoopOk = !kill ? false : OPT.scoop ? hpFrac > 0.3 && !mechs.some((e) => d2(e.pos, p) < 40) && t - kill!.t < 12 : ![...this.attackers.values()].some((a) => t - a.t < 2.5) && !mechs.some((e) => d2(e.pos, p) < 75) && t - kill!.t < 8
+      if (kill && !goal && scoopOk) {
         let closest = 100
         for (const { item: cube } of this.cubes.values()) {
           const distance = d2(p, cube.pos)
@@ -1183,6 +1188,21 @@ export class Brain {
         const cap = 4.4 / walk
         if (l > cap) moveDir = [(moveDir[0] / l) * cap, (moveDir[1] / l) * cap]
         boost = false
+      }
+    }
+
+    // ---- grab nearby kill cubes even mid-fight
+    if (OPT.scoop && this.lastKill && t - this.lastKill.t < 12 && this.mode === "fight" && hpFrac > 0.3) {
+      let cube: number[] | null = null, cd = 16
+      for (const { item } of this.cubes.values()) {
+        const dc = d2(item.pos, p)
+        if (dc < cd && d2(item.pos, this.lastKill.pos) < 15 && Math.abs(item.pos[2] - p[2]) < 4) { cd = dc; cube = item.pos }
+      }
+      if (cube) {
+        const dx = cube[0] - p[0], dy = cube[1] - p[1], L = Math.hypot(dx, dy) || 1
+        const ml = Math.hypot(moveDir[0], moveDir[1]) || 1
+        moveDir = this.freeDir(p, [dx / L * 0.75 + moveDir[0] / ml * 0.35, dy / L * 0.75 + moveDir[1] / ml * 0.35])
+        this.mode = "fight+scoop"
       }
     }
 
