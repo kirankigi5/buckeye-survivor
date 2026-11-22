@@ -17,10 +17,13 @@ const d2 = (a: number[], b: number[]) => Math.hypot(a[0] - b[0], a[1] - b[1])
 type Enemy = { id: number; pos: number[]; vel: number[]; aim: number[]; hp: number; maxHp: number; cubes: number; weapons: string[]; charging: boolean; seen: number; npc: boolean }
 type Mem<T> = { item: T; seen: number }
 
+// Practice placement is how many house bots die before we do, and they do not
+// fight each other. Shorter gunfights (damage, fire rate) come before tanking.
+// Nanites matter once a fight is over: regen only runs while we deal no damage.
 const UPGRADE_PRIORITY = [
-  "armor", "plating", "gun_damage", "laser_damage", "nanites", "laser_charge", "lightning_efficiency", "lightning_range",
-  "gun_rate", "gyros", "lightning_chain", "servos", "gun_mag", "gun_velocity", "capacitor",
-  "reactor", "jets", "mortar_reload", "mortar_velocity", "mortar_splash", "sensors", "laser_pierce",
+  "gun_damage", "gun_rate", "laser_damage", "laser_charge", "lightning_efficiency", "lightning_range",
+  "nanites", "plating", "armor", "gun_mag", "lightning_chain", "gyros", "gun_velocity", "servos",
+  "capacitor", "reactor", "jets", "mortar_reload", "mortar_velocity", "mortar_splash", "sensors", "laser_pierce",
 ]
 const WEAPON_VALUE: Record<string, number> = { laser: 3, lightning: 3, mortar: 1, gun: 0 }
 
@@ -563,7 +566,15 @@ export class Brain {
       } else if (OPT.stealth && !attacker) {
         const toMe = Math.atan2(p[1] - e.pos[1], p[0] - e.pos[0])
         const aware = Math.abs(angDiff(e.aim[0], toMe)) < 0.5
+        const company = mechs.filter((o) => o.id !== e.id && d2(o.pos, p) < 130).length
+        const alive = obs.alive ?? 16
         engage = dd < 45 || (aware && dd < 90) || (eFrac < 0.3 && hpFrac > 0.5 && dd < 120) || z.next_radius <= 25
+        // One hunter while the squad is still intact: fight them at gun range instead of letting them walk in for free.
+        if (company === 0 && hpFrac > 0.55 && dd < 175 && los && alive >= 13) engage = true
+        // Finish a lone wounded mech before it breaks line of sight and regenerates.
+        if (company === 0 && eFrac < 0.42 && hpFrac > 0.45 && dd < 190 && los) engage = true
+        // Once several are already on us, new long shots only feed them our position.
+        if (company >= 2 && dd > 48 && eFrac > 0.28) engage = false
       } else if (OPT.cautious && !attacker) {
         const toMe = Math.atan2(p[1] - e.pos[1], p[0] - e.pos[0])
         const aware = Math.abs(angDiff(e.aim[0], toMe)) < 0.6 && dd < 210
@@ -583,7 +594,8 @@ export class Brain {
       for (const e of npcs) {
         const dd = d2(e.pos, p)
         const attacker = this.attackers.has(e.id) && t - this.attackers.get(e.id)!.t < 4
-        const farm = (OPT.farm || !OPT.stealth) && !mechThreatNear && hpFrac > (OPT.farm ? 0.45 : 0.55) && dd < (OPT.farm ? 130 : 90) && (gunOk || ltg || laser || (gun && hpFrac > 0.7)) && !zoneUrgent
+        // Shooting a drone deals damage and restarts the 5 s regen timer. Farm only while healthy.
+        const farm = (OPT.farm || !OPT.stealth) && !mechThreatNear && hpFrac > 0.72 && dd < (OPT.farm ? 130 : 90) && (gunOk || ltg || laser) && !zoneUrgent
         if ((attacker || farm) && visibleNow.has(e.id) && hasLos(e) && dd < bd) { bd = dd; npcTarget = e }
       }
     }
@@ -732,6 +744,8 @@ export class Brain {
       if (hpFrac < 0.33 && (eFrac > hpFrac + 0.05 || nearEnemies > 1)) retreatNow = true
       if (hpFrac < this.retreatHp && taken6 > dealt6 * 1.5 + 250 && eFrac > 0.3) retreatNow = true
       if (nearEnemies > 2 && hpFrac < 0.7) retreatNow = true
+      // Two hunters focus fire. Leave unless this one is already almost dead.
+      if (nearEnemies >= 2 && hpFrac < 0.62 && eFrac > 0.25) retreatNow = true
       if (OPT.duel && eFrac > 0.3) {
         const attackers = new Set(this.taken.filter((x) => t - x.t < 2.5 && x.by !== undefined && x.by >= 0 && x.by < 16).map((x) => x.by))
         if (hpFrac < 0.75 && attackers.size >= 2) retreatNow = true
@@ -832,6 +846,11 @@ export class Brain {
           radial = 0.65
         }
       }
+      // A second hunter nearby: back out of the pocket instead of walking between them.
+      if (!e.npc && nearEnemies >= 2 && e.hp > e.maxHp * 0.22 && dd > 36) {
+        radial = Math.min(radial, -0.45)
+        boost = me.energy > 20 || boost
+      }
       let mx = -uy * lateral + ux * radial, my = ux * lateral + uy * radial
       // dodge a laser that is charging at us
       if (e.charging && Math.abs(angDiff(e.aim[0], Math.atan2(-dy, -dx))) < 0.25) {
@@ -868,7 +887,10 @@ export class Brain {
       for (const dr of obs.drops) {
         const dd = d2(dr.pos, p)
         const contested = mechs.some((e) => d2(e.pos, dr.pos) < 45 && t - e.seen < 4)
-        if (dd < 170 && dr.lands_in < dd / walk + 8 && !contested && ptOk(dr.pos) && (dr.holder == null || dr.holder === me.id)) {
+        // A drop is a full heal. Travel farther for it after a bad trade than while healthy.
+        const dropReach = hpFrac < 0.65 ? 240 : 170
+        const dropWait = hpFrac < 0.65 ? 14 : 8
+        if (dd < dropReach && dr.lands_in < dd / walk + dropWait && !contested && ptOk(dr.pos) && (dr.holder == null || dr.holder === me.id)) {
           goal = [dr.pos[0], dr.pos[1]]
           goalKind = "drop"
           if (dd < dr.radius - 2) goal = [p[0], p[1]]
@@ -890,6 +912,20 @@ export class Brain {
         if (!goal && d2(p, kill.pos) > 6 && d2(p, kill.pos) < 75 && ptOk(kill.pos)) {
           goal = kill.pos
           goalKind = "kill-cubes"
+        }
+      }
+      // A mech we already hurt, now out of sight, heals after 5 quiet seconds. Catch it while the estimate is still low.
+      if (!goal && hpFrac > 0.62 && !zoneUrgent && ![...this.attackers.values()].some((a) => t - a.t < 1.2)) {
+        let bestEst = Infinity
+        for (const e of mechs) {
+          if (visibleNow.has(e.id) || t - e.seen > 4.5) continue
+          const quiet = Math.max(0, t - e.seen - 5)
+          const est = e.hp + quiet * (this.cfg.mech?.regen_per_s ?? 45)
+          if (est / e.maxHp > 0.38 || est > me.hp * 0.85) continue
+          if (mechs.some((o) => o.id !== e.id && d2(o.pos, e.pos) < 75)) continue
+          const distance = d2(e.pos, p)
+          if (distance > 110 || distance < 8 || !ptOk(e.pos)) continue
+          if (est < bestEst) { bestEst = est; goal = [e.pos[0], e.pos[1]]; goalKind = "finish" }
         }
       }
       // weapons
@@ -918,7 +954,7 @@ export class Brain {
           if (dd < bd && ptOk(c.pos)) { bd = dd; goal = [c.pos[0], c.pos[1]]; goalKind = "cube" }
         }
       }
-      if (OPT.farm && !goal && !mechThreatNear && hpFrac > 0.5 && !zoneUrgent) {
+      if (OPT.farm && !goal && !mechThreatNear && hpFrac > 0.72 && !zoneUrgent) {
         // hunt remembered drones, then crates
         let bd = 220
         for (const e of this.enemies.values()) {
@@ -946,7 +982,8 @@ export class Brain {
         this.mode = goalKind
         this.holdSpot = null
         moveDir = d2(goal, p) < 0.6 ? [0, 0] : this.navTo(obs, goal, avoid)
-        if (goalKind === "kill-cubes" && me.energy > 65 && d2(goal, p) > 20) boost = true
+        if ((goalKind === "kill-cubes" || goalKind === "finish") && me.energy > 50 && d2(goal, p) > 18) boost = true
+        if (goalKind === "drop" && hpFrac < 0.7 && me.energy > 35 && d2(goal, p) > 12) boost = true
         if (goalKind === "drop" && d2(goal, p) < 3) moveDir = [0, 0]
       } else {
         this.mode = "hold"
@@ -1164,19 +1201,26 @@ export class Brain {
           const lead = this.leadPoint(muzzle, e, 1e9, 0.0)
           const ready = charge >= full - 0.06
           const on = los && this.onTarget(me, muzzle, lead, hw * 0.9, hh)
-          // release (fire) when fully charged and on target
-          if (ready && on) fire[laserSlot] = false
+          const lx = e.pos[0] - p[0], ly = e.pos[1] - p[1], ll = Math.hypot(lx, ly) || 1
+          const lateral = Math.abs(e.vel[0] * (-ly / ll) + e.vel[1] * (lx / ll))
+          const minCharge = laser.stats.min_charge ?? 0.15
+          // A long charge is announced (charging flag plus the sound). Release early
+          // when they are already stepping across the beam, or when we need our legs.
+          const early = on && charge >= Math.max(minCharge, full * 0.45) && (lateral > 8 || nearEnemies >= 2 || this.mode === "retreat" || hpFrac < 0.4)
+          if ((ready && on) || early) fire[laserSlot] = false
           else if (t - this.laserHoldStart > full + 1.6) fire[laserSlot] = false
           else fire[laserSlot] = true
         } else {
           this.laserHoldStart = -1
-          if (laser.cooldown <= 0.05 && los && dd < (laser.stats.range ?? 280) && primary === "laser") fire[laserSlot] = true
+          const start = laser.cooldown <= 0.05 && los && dd < (laser.stats.range ?? 280) && primary === "laser"
+            && this.mode !== "retreat" && !(nearEnemies >= 2 && hpFrac < 0.55)
+          if (start) fire[laserSlot] = true
         }
       }
     } else {
       if (!(laser && (laser.charge ?? 0) > 0)) this.laserHoldStart = -1
       // shoot crates for loot when it is calm
-      const calm = this.mode !== "rush" && this.mode !== "equip" && (OPT.farm || !OPT.stealth) && !mechThreatNear && t - this.lastDamageT > 6 && !zoneUrgent
+      const calm = this.mode !== "rush" && this.mode !== "equip" && this.mode !== "finish" && (OPT.farm || !OPT.stealth) && !mechThreatNear && hpFrac > 0.72 && t - this.lastDamageT > 6 && !zoneUrgent
       if (calm && ((gun && gunOk) || (ltg && me.energy > 40))) {
         let best: { id: number; pos: number[]; hp: number } | null = null, bd = OPT.farm ? 90 : 70
         for (const [, m] of this.crates) {

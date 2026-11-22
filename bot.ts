@@ -7,7 +7,7 @@ run((hello: Hello) => {
   const n = brain.world ? Brain.warmup(hello, brain.world, 1500) : 0
   log(`init ${(performance.now() - t0).toFixed(0)} ms, world ${brain.world ? "ok" : "missing"}, warmup ${n}`)
   return {
-    name: "buckeye-survivor",
+    name: "buckeye-hunter",
     act(obs: Observation) {
       const t1 = performance.now()
       const a = brain.act(obs)

@@ -19,14 +19,16 @@ A Mech Royale (`mechfight/1`) bot written in TypeScript and run with Bun. It pla
 - **Navigation:** A* on a wall-inflated grid with line-of-sight path smoothing, wall repulsion, and jump-and-jet when stuck.
 - **Loot:** walks to weapons, cubes, and uncontested supply drops when that is safe for the zone. Shoots crates when nothing is around. Ends up with laser + lightning when it can.
 - **Combat:**
+  - while most of the squad is still alive, it fights a lone visible hunter out to gun range instead of waiting to be shot;
+  - once two or more are close and it is hurt, it breaks off unless the current target is nearly dead;
   - gun shots lead the target and fire only when the shot is lined up and not blocked;
-  - laser charges fully and is released on target;
+  - laser charges fully against a steady target, and releases early if the target is strafing, a second hunter is close, or it is already retreating;
   - lightning fires whenever a target is in its cone;
   - mortar uses a ballistic solution and lobs over cover;
   - keeps its torso on the attacker to avoid ×1.5 rear damage, and strafes randomly (left / right / stop) to beat lead aiming;
   - dodges charging lasers, incoming bullets, and mortar landings.
-- **Survival:** takes cover while reloading. Retreats out of line of sight when losing the damage trade, low on HP, or outnumbered. Turns toward and evades attackers it can't see.
-- **Upgrades:** armor > plating > gun damage > laser damage > nanites > the remaining upgrades.
+- **Survival:** takes cover while reloading. Retreats out of line of sight when losing the damage trade, low on HP, or outnumbered. Turns toward and evades attackers it can't see. Below about 72% HP it stops farming drones and crates, because dealing damage restarts the regen timer. It will walk farther for an uncontested supply drop while hurt. It chases a wounded mech that just left view only when that mech is still alone and low.
+- **Upgrades:** gun damage > gun fire rate > laser damage > laser charge > lightning efficiency and range > nanites > plating > armor > the remaining upgrades.
 
 ## Check locally
 
