@@ -68,7 +68,7 @@ export class Brain {
   lastTargetT = -100
   t = 0
 
-  constructor(hello: Hello) {
+  constructor(hello: Hello, shared?: World) {
     this.cfg = hello.config
     this.slot = hello.slot
     let s = (hello.seed >>> 0) || 12345
@@ -78,6 +78,7 @@ export class Brain {
       s ^= s << 5; s >>>= 0
       return s / 4294967296
     }
+    if (shared) { this.world = shared; return }
     const here = new URL(".", import.meta.url).pathname
     for (const dir of [hello.map?.dir, "/arena", here + "arena", "arena"]) {
       if (!dir) continue
@@ -362,6 +363,39 @@ export class Brain {
   /** ms left of this decision's compute budget */
   left(total = 9) {
     return total - (performance.now() - this.tickStart)
+  }
+
+  /** Run the hot code paths on synthetic observations so the JIT has compiled them before the match. */
+  static warmup(hello: Hello, world: World, ms = 1500) {
+    const t0 = performance.now()
+    const tmp = new Brain(hello, world)
+    const c = hello.config.zone.start_center
+    let k = 0
+    while (performance.now() - t0 < ms && k < 400) {
+      const a = (k * 2.39996) % (Math.PI * 2), r = 50 + (k * 37) % 300
+      const me = [c[0] + Math.cos(a) * r, c[1] + Math.sin(a) * r]
+      me.push(world.ground(me[0], me[1]))
+      const en = [me[0] + 60 * Math.cos(a + 1), me[1] + 60 * Math.sin(a + 1)]
+      en.push(world.ground(en[0], en[1]))
+      const obs: any = {
+        type: "obs", tick: k * 2, t: k * 0.1, alive: 16,
+        self: { id: 0, pos: me, vel: [0, 0, 0], aim: [a, 0], hp: k % 3 ? 1400 : 300, max_hp: 1400, energy: 100, max_energy: 100, grounded: true, cubes: 0, upgrades: [], in_zone: true,
+          weapons: [{ kind: "gun", cooldown: 0, ammo: 12, reload: 0, stats: hello.config.weapons.gun }, k % 2 ? { kind: "laser", cooldown: 0, charge: k % 4 ? 0.8 : 0, stats: hello.config.weapons.laser } : { kind: "lightning", cooldown: 0, stats: hello.config.weapons.lightning }],
+          stats: { ...hello.config.mech } },
+        mechs: k % 5 === 4 ? [] : [{ id: 1, kind: "mech", pos: en, vel: [5, -3, 0], aim: [a + Math.PI, 0], hp: 900, max_hp: 1400, cubes: 0, weapons: ["gun", "laser"], charging: k % 3 === 0 }],
+        projectiles: [{ id: 1, kind: "gun", pos: [en[0], en[1], en[2] + 7], vel: [(me[0] - en[0]) * 4, (me[1] - en[1]) * 4, 0] }, { id: 2, kind: "mortar", pos: [en[0], en[1], en[2] + 20], vel: [10, 0, 5] }],
+        crates: [{ id: 1000, pos: [me[0] + 20, me[1], me[2]], hp: 300 }], cubes: [{ id: 5000, pos: [me[0] + 30, me[1] + 5, me[2]] }],
+        pickups: [{ id: 8000, kind: "lightning", pos: [me[0] - 40, me[1], me[2]] }],
+        sounds: [{ kind: "gun", bearing: a, dist: "near", age: 0 }], beams: [],
+        events: k % 4 === 1 ? [{ type: "damaged", amount: 45, weapon: "gun", bearing: a + 2, by: k % 8 === 1 ? 1 : 2 }] : [],
+        drops: [{ id: 20000, pos: [me[0] + 50, me[1] + 50, me[2]], radius: 8, lands_in: 0, capture_s: 4, progress: 0, holder: null }],
+        zone: { center: c, radius: 560, next_center: [c[0] + 40, c[1] - 20], next_radius: k % 2 ? 380 : 140, shrink_start: 60, shrink_end: 110, dps: 20 },
+        offer: k % 7 === 0 ? { id: 1, expires: 99, choices: [{ id: "armor", name: "", desc: "" }, { id: "gyros", name: "", desc: "" }] } : null,
+      }
+      try { tmp.decide(obs) } catch (e) { if (k === 0) console.error("warmup", e) }
+      k++
+    }
+    return k
   }
 
   errors = 0
