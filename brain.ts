@@ -126,6 +126,22 @@ export class Brain {
   los(a: number[], b: number[]) {
     return this.world ? this.world.los(a, b) : true
   }
+  /** A short walk to a weapon that passes beside a wall. Long open runs are refused. */
+  shelteredPickup(from: number[], to: number[]): boolean {
+    const w = this.world
+    if (!w) return true
+    const dist = d2(from, to)
+    if (dist > 64) return false
+    if (dist < 24) return true
+    let besideWall = 0
+    for (let i = 1; i <= 4; i++) {
+      const f = i / 5
+      const x = from[0] + (to[0] - from[0]) * f
+      const y = from[1] + (to[1] - from[1]) * f
+      if (w.clearAt(x, y) < 4.2) besideWall++
+    }
+    return besideWall >= 1
+  }
 
   /** Zone circle at time tt (interpolating during shrink). */
   zoneAt(obs: Observation, tt: number): { c: number[]; r: number } {
@@ -556,6 +572,9 @@ export class Brain {
     const [mortar, mortarSlot] = this.weapon(me, "mortar")
     const gunOk = !!gun && (gun.ammo ?? 1) > 0 && !(gun.reload > 0)
 
+    // Last portion of the match, or a small circle: stop picking fights.
+    const lateCaution = t >= 268 || z.next_radius <= 96 || z.radius <= 125
+
     // ---- choose a target
     const recentlyHit = t - this.lastDamageT < 4
     let target: Enemy | null = null
@@ -575,6 +594,7 @@ export class Brain {
         const toMe = Math.atan2(p[1] - e.pos[1], p[0] - e.pos[0])
         const aware = Math.abs(angDiff(e.aim[0], toMe)) < 0.5
         engage = dd < 45 || (aware && dd < 90) || (eFrac < 0.3 && hpFrac > 0.5 && dd < 120) || z.next_radius <= 25
+        if (lateCaution && !attacker) engage = dd < 28 || z.next_radius <= 25
       } else if (OPT.cautious && !attacker) {
         const toMe = Math.atan2(p[1] - e.pos[1], p[0] - e.pos[0])
         const aware = Math.abs(angDiff(e.aim[0], toMe)) < 0.6 && dd < 210
@@ -594,7 +614,7 @@ export class Brain {
       for (const e of npcs) {
         const dd = d2(e.pos, p)
         const attacker = this.attackers.has(e.id) && t - this.attackers.get(e.id)!.t < 4
-        const farm = (OPT.farm || !OPT.stealth) && !mechThreatNear && hpFrac > (OPT.farm ? 0.45 : 0.55) && dd < (OPT.farm ? 130 : 90) && (gunOk || ltg || laser || (gun && hpFrac > 0.7)) && !zoneUrgent
+        const farm = !lateCaution && (OPT.farm || !OPT.stealth) && !mechThreatNear && hpFrac > (OPT.farm ? 0.45 : 0.55) && dd < (OPT.farm ? 130 : 90) && (gunOk || ltg || laser || (gun && hpFrac > 0.7)) && !zoneUrgent
         if ((attacker || farm) && visibleNow.has(e.id) && hasLos(e) && dd < bd) { bd = dd; npcTarget = e }
       }
     }
@@ -730,6 +750,7 @@ export class Brain {
         if (distance >= bestDist || distance < (this.cfg.loot.pickup_radius ?? 4) - 0.2 || !pickupWant(pk)) continue
         if (Math.abs(pk.pos[2] - (this.world?.ground(pk.pos[0], pk.pos[1]) ?? pk.pos[2])) > 2 || !ptOk(pk.pos)) continue
         if (mechs.some((e) => d2(e.pos, pk.pos) < 50)) continue
+        if (!this.shelteredPickup(p, pk.pos)) continue
         bestDist = distance
         equipGoal = pk
       }
@@ -760,7 +781,7 @@ export class Brain {
     } else if (equipGoal && !retreat) {
       this.mode = "equip"
       moveDir = this.navTo(obs, equipGoal.pos, avoid)
-      boost = me.energy > 60 && d2(equipGoal.pos, p) > 15
+      boost = !this.world && me.energy > 60 && d2(equipGoal.pos, p) > 15
     } else if (rushGoal && !retreat) {
       this.mode = "rush"
       const dd = d2(rushGoal, p)
@@ -952,6 +973,7 @@ export class Brain {
           }
         }
       }
+      if (lateCaution && goal && goalKind !== "kill-cubes" && goalKind !== "drop") goal = null
       if (goal && safeTime < 5) goal = null
       if (goal) {
         this.mode = goalKind
