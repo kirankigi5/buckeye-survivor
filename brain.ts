@@ -126,6 +126,22 @@ export class Brain {
   los(a: number[], b: number[]) {
     return this.world ? this.world.los(a, b) : true
   }
+  /** A short walk to a weapon that passes beside a wall. Long open runs are refused. */
+  shelteredPickup(from: number[], to: number[]): boolean {
+    const w = this.world
+    if (!w) return true
+    const dist = d2(from, to)
+    if (dist > 64) return false
+    if (dist < 24) return true
+    let besideWall = 0
+    for (let i = 1; i <= 4; i++) {
+      const f = i / 5
+      const x = from[0] + (to[0] - from[0]) * f
+      const y = from[1] + (to[1] - from[1]) * f
+      if (w.clearAt(x, y) < 4.2) besideWall++
+    }
+    return besideWall >= 1
+  }
 
   /** Zone circle at time tt (interpolating during shrink). */
   zoneAt(obs: Observation, tt: number): { c: number[]; r: number } {
@@ -730,6 +746,7 @@ export class Brain {
         if (distance >= bestDist || distance < (this.cfg.loot.pickup_radius ?? 4) - 0.2 || !pickupWant(pk)) continue
         if (Math.abs(pk.pos[2] - (this.world?.ground(pk.pos[0], pk.pos[1]) ?? pk.pos[2])) > 2 || !ptOk(pk.pos)) continue
         if (mechs.some((e) => d2(e.pos, pk.pos) < 50)) continue
+        if (!this.shelteredPickup(p, pk.pos)) continue
         bestDist = distance
         equipGoal = pk
       }
@@ -760,7 +777,7 @@ export class Brain {
     } else if (equipGoal && !retreat) {
       this.mode = "equip"
       moveDir = this.navTo(obs, equipGoal.pos, avoid)
-      boost = me.energy > 60 && d2(equipGoal.pos, p) > 15
+      boost = !this.world && me.energy > 60 && d2(equipGoal.pos, p) > 15
     } else if (rushGoal && !retreat) {
       this.mode = "rush"
       const dd = d2(rushGoal, p)
