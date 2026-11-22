@@ -14,7 +14,7 @@ A Mech Royale (`mechfight/1`) bot written in TypeScript and run with Bun. It pla
 
 ## Behaviour
 
-- **Opening:** scans for drones, closes on a safe visible or remembered target, uses normal lead aiming, and prioritizes collecting its dropped cubes. Drone gunfire can guide a search, but does not create a firing target. Player threats, low health and zone deadlines interrupt the rush; it ends after two cubes or 30 seconds. Set `MF_RUSH=0` to compare without it.
+- **Opening:** for the first part of the match, a laser or lightning on the ground outranks a drone that is not already at the muzzle, and the mech boosts toward that weapon. Otherwise it scans for drones, closes on a safe visible or remembered target, uses normal lead aiming, and prioritizes collecting its dropped cubes. Drone gunfire can guide a search, but does not create a firing target. Player threats, low health and zone deadlines interrupt the rush; it ends after two cubes or 30 seconds. Set `MF_RUSH=0` to compare without it.
 - **Zone:** works out when the shrinking circle will reach its position and leaves early enough to walk (or boost) into the next circle with a margin.
 - **Navigation:** A* on a wall-inflated grid with line-of-sight path smoothing, wall repulsion, and jump-and-jet when stuck.
 - **Loot:** walks to weapons, cubes, and uncontested supply drops when that is safe for the zone. Shoots crates when nothing is around. Ends up with laser + lightning when it can.

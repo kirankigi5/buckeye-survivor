@@ -76,6 +76,22 @@ test("low health cancels the opening objective", () => {
   b.act(o); assert.equal(b.spawnRushDone, true); assert.notEqual(b.mode, "rush")
 })
 
+test("goes out of its way for an opening weapon and stays on a drone already in reach", () => {
+  const far = fixture()
+  far.drone.pos = [70, 0, 0]
+  far.o.pickups = [{ id: 8000, kind: "lightning", pos: [0, 95, 0] }]
+  const detour = far.b.act(far.o)
+  assert.equal(far.b.mode, "equip")
+  assert.ok(detour.move![1] > 0.9)
+  assert.equal(detour.boost, true)
+  const close = fixture()
+  close.drone.pos = [14, 0, 0]
+  close.o.pickups = [{ id: 8000, kind: "laser", pos: [0, 90, 0] }]
+  const stay = close.b.act(close.o)
+  assert.equal(close.b.mode, "rush")
+  assert.ok(stay.move![0] > 0.5)
+})
+
 test("takes a short detour for a laser before committing to a distant drone", () => {
   const { b, o } = fixture()
   o.pickups = [{ id: 8000, kind: "laser", pos: [0, 40, 0] }]
