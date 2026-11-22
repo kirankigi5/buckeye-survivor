@@ -731,7 +731,10 @@ export class Brain {
     const unseenHit = !fightTarget && this.taken.some((x) => t - x.t < 2.5) && this.threatBearings.some((b) => b.kind === "damage" && t - b.t < 2.5)
     let equipGoal: PickupObs | null = null
     if (OPT.equipFirst && !rushReward && !target && !recentlyHit && !laser && !ltg && !zoneUrgent && t < 60) {
-      let bestDist = rushEnemy && d2(rushEnemy.pos, p) < 40 ? 20 : rushEnemy ? 55 : 115
+      // The first secondary weapon is worth more than a drone that is not already under the muzzle.
+      const openingGrab = t < 26
+      const onTopOfDrone = !!rushEnemy && d2(rushEnemy.pos, p) < 16
+      let bestDist = onTopOfDrone ? 18 : openingGrab ? 155 : rushEnemy ? 55 : 115
       for (const { item: pk } of this.pickups.values()) {
         if (pk.kind !== "laser" && pk.kind !== "lightning") continue
         const distance = d2(p, pk.pos)
@@ -768,7 +771,7 @@ export class Brain {
     } else if (equipGoal && !retreat) {
       this.mode = "equip"
       moveDir = this.navTo(obs, equipGoal.pos, avoid)
-      boost = me.energy > 60 && d2(equipGoal.pos, p) > 15
+      boost = me.energy > (t < 26 ? 42 : 60) && d2(equipGoal.pos, p) > (t < 26 ? 8 : 15)
     } else if (rushGoal && !retreat) {
       this.mode = "rush"
       const dd = d2(rushGoal, p)
