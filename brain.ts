@@ -112,6 +112,17 @@ export class Brain {
   scale(cubes: number) {
     return 1 + (this.cfg.cubes.size_per_cube ?? 0.05) * (cubes || 0)
   }
+  /** Beam damage at this charge: upgrade stats, cube bonus, and cook-off on a mortar carrier. */
+  beamHurt(laser: WeaponObs, charge: number, mortar: boolean, cubes: number): number {
+    const full = laser.stats.charge || 0.75
+    const minFrac = laser.stats.min_frac ?? 0.35
+    const frac = minFrac + (1 - minFrac) * clamp(charge / full, 0, 1)
+    const per = this.cfg.cubes?.damage_per_cube ?? 0.04
+    const cap = this.cfg.cubes?.stat_cap ?? 10
+    let dmg = (laser.stats.damage ?? 315) * frac * (1 + per * Math.min(Math.max(0, cubes), cap))
+    if (mortar) dmg *= 1 + (this.cfg.weapons?.laser?.cookoff ?? 0.6)
+    return dmg
+  }
   los(a: number[], b: number[]) {
     return this.world ? this.world.los(a, b) : true
   }
@@ -1176,11 +1187,15 @@ export class Brain {
         if (charge > 0) {
           if (this.laserHoldStart < 0) this.laserHoldStart = t
           const lead = this.leadPoint(muzzle, e, 1e9, 0.0)
-          const ready = charge >= full - 0.06
           const on = los && this.onTarget(me, muzzle, lead, hw * 0.9, hh)
-          // release (fire) when fully charged and on target
-          if (ready && on) fire[laserSlot] = false
-          else if (t - this.laserHoldStart > full + 1.6) fire[laserSlot] = false
+          const minCharge = laser.stats.min_charge ?? 0.15
+          const hurt = this.beamHurt(laser, Math.max(charge, minCharge), e.weapons.includes("mortar"), me.cubes)
+          const lethal = hurt >= e.hp
+          const fullReady = charge >= full - 0.06
+          // Let go only for a full beam or one that finishes them. A visible target
+          // is never dumped on a timer; a hidden one still is, so we are not stuck slow.
+          if (charge >= minCharge && on && (fullReady || lethal)) fire[laserSlot] = false
+          else if (!los && t - this.laserHoldStart > full + 1.6) fire[laserSlot] = false
           else fire[laserSlot] = true
         } else {
           this.laserHoldStart = -1

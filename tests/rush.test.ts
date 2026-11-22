@@ -134,6 +134,49 @@ test("dodges a shot that intersects the mech's current movement", () => usePredi
   assert.ok(Math.abs(b.act(o).move![1]) > 0.9)
 }))
 
+function laserFight(charge: number, hp: number, cubes = 0, mortar = false) {
+  const { b, o } = fixture()
+  step(o, 40)
+  o.self.cubes = cubes
+  o.self.aim = [0, 0]
+  o.mechs = [{ id: 3, kind: "mech", pos: [40, 0, 0], vel: [0, 0, 0], aim: [Math.PI, 0], hp, max_hp: 1400, weapons: mortar ? ["gun", "mortar"] : ["gun"], charging: false }]
+  const gunStats = o.self.weapons[0].stats
+  o.self.weapons[1] = { kind: "laser", cooldown: 0, charge, stats: { ...gunStats, damage: 315, charge: 0.75, range: 280, min_frac: 0.35, min_charge: 0.15 } }
+  const aimed = b.act(o)
+  o.self.aim = [aimed.aim![0], aimed.aim![1]]
+  step(o, 40.1)
+  o.self.weapons[1].charge = charge
+  return b.act(o)
+}
+
+test("releases a partial laser when the beam would kill", () => {
+  const held = laserFight(0.3, 1400)
+  assert.equal(held.fire![1], true)
+  const finished = laserFight(0.3, 220, 6)
+  assert.equal(finished.fire![1], false)
+})
+
+test("cook-off makes a mortar carrier lethal before a full charge", () => {
+  const plain = laserFight(0.35, 250, 0, false)
+  assert.equal(plain.fire![1], true)
+  const cooked = laserFight(0.35, 250, 0, true)
+  assert.equal(cooked.fire![1], false)
+})
+
+test("does not dump a visible laser on the old charge timer", () => {
+  const { b, o } = fixture()
+  step(o, 40)
+  o.mechs = [{ id: 3, kind: "mech", pos: [40, 0, 0], vel: [0, 0, 0], aim: [Math.PI, 0], hp: 1400, max_hp: 1400, weapons: ["gun"], charging: false }]
+  const gunStats = o.self.weapons[0].stats
+  o.self.weapons[1] = { kind: "laser", cooldown: 0, charge: 0.3, stats: { ...gunStats, damage: 315, charge: 0.75, range: 280, min_frac: 0.35, min_charge: 0.15 } }
+  o.self.aim = [2, 0]
+  b.act(o)
+  step(o, 44)
+  o.self.weapons[1].charge = 0.3
+  o.self.aim = [2, 0]
+  assert.equal(b.act(o).fire![1], true)
+})
+
 test("gun keeps firing on its own lead while a laser is still charging", () => {
   const { b, o } = fixture()
   step(o, 40)
