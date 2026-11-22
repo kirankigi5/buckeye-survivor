@@ -76,6 +76,17 @@ export class World {
   private heapIdx: Int32Array
   private heapF: Float32Array
 
+  // trees: crowns are ellipsoids (soft vision blockers), trunks are vertical cylinders (hard)
+  trees: { x: number; y: number; z: number; trunkR: number; trunkTop: number; cx: number; cy: number; cz: number; r: number; rz: number }[] = []
+  tgrid: Int32Array[] = []
+  tgx = 0
+  tgy = 0
+  canopyDensity = 0.35
+  canopyBlockT = 0.25
+  private tstamp: Uint32Array = new Uint32Array(0)
+  private tgen = 1
+  static TB = 16
+
   constructor(dir: string) {
     const w = JSON.parse(readFileSync(join(dir, "v2/world.json"), "utf8"))
     const T = w.terrain
@@ -98,6 +109,33 @@ export class World {
       }
       const holes: number[][] = (p.holes ?? []).map((h: any) => (Array.isArray(h[0]) ? h.flat() : h))
       this.prisms.push({ kind: p.kind, base: p.base, top: p.top, ring: r, holes, minX: a, minY: b, maxX: c, maxY: d })
+    }
+    // trees
+    if (w.rules) {
+      this.canopyDensity = w.rules.canopyDensity ?? 0.35
+      this.canopyBlockT = w.rules.canopyBlockT ?? 0.25
+    }
+    if (w.trees?.fields) {
+      const f: string[] = w.trees.fields, d: number[] = w.trees.data, n = f.length
+      const ix = (k: string) => f.indexOf(k)
+      const [a, b, c, hh, cr, cb, tr, cxI, cyI] = ["x", "y", "z", "height", "crownR", "crownBase", "trunkR", "crownX", "crownY"].map(ix)
+      for (let e = 0; e + n <= d.length; e += n) {
+        const z = d[e + c], h = d[e + hh], base = z + d[e + cb], top = z + h
+        this.trees.push({ x: d[e + a], y: d[e + b], z, trunkR: d[e + tr], trunkTop: z + Math.max(d[e + cb] + 0.5 * (h - d[e + cb]), 3),
+          cx: cxI >= 0 ? d[e + cxI] : d[e + a], cy: cyI >= 0 ? d[e + cyI] : d[e + b], cz: (base + top) / 2, r: d[e + cr], rz: Math.max((top - base) / 2, 0.5) })
+      }
+      const TB = World.TB
+      this.tgx = Math.ceil((this.maxX - this.minX) / TB) + 1
+      this.tgy = Math.ceil((this.maxY - this.minY) / TB) + 1
+      const cells: number[][] = Array.from({ length: this.tgx * this.tgy }, () => [])
+      this.trees.forEach((t, i) => {
+        const rr = Math.max(t.r, t.trunkR)
+        const x0 = Math.min(t.cx, t.x) - rr, x1 = Math.max(t.cx, t.x) + rr, y0 = Math.min(t.cy, t.y) - rr, y1 = Math.max(t.cy, t.y) + rr
+        for (let gy = Math.max(0, Math.floor((y0 - this.minY) / TB)); gy <= Math.min(this.tgy - 1, Math.floor((y1 - this.minY) / TB)); gy++)
+          for (let gx = Math.max(0, Math.floor((x0 - this.minX) / TB)); gx <= Math.min(this.tgx - 1, Math.floor((x1 - this.minX) / TB)); gx++) cells[gy * this.tgx + gx].push(i)
+      })
+      this.tgrid = cells.map((c) => Int32Array.from(c))
+      this.tstamp = new Uint32Array(this.trees.length)
     }
     // grid
     this.ox = this.minX
@@ -423,5 +461,67 @@ export class World {
 
   los(a: number[], b: number[]): boolean {
     return this.segHit(a, b) < 0
+  }
+
+  /**
+   * Canopy transmittance along a->b (1 = clear), or 0 if a trunk blocks it.
+   * Mirrors the server: exp(-canopyDensity * metres of crown crossed).
+   */
+  canopy(a: number[], b: number[]): number {
+    if (!this.trees.length) return 1
+    const dx = b[0] - a[0], dy = b[1] - a[1], dz = b[2] - a[2]
+    const L = Math.hypot(dx, dy, dz)
+    const gen = ++this.tgen
+    let u = 0
+    const TB = World.TB
+    const steps = Math.max(1, Math.ceil(Math.hypot(dx, dy) / (TB * 0.5)))
+    let lastCell = -1
+    for (let s = 0; s <= steps; s++) {
+      const x = a[0] + (dx * s) / steps, y = a[1] + (dy * s) / steps
+      const gx = Math.floor((x - this.minX) / TB), gy = Math.floor((y - this.minY) / TB)
+      for (let oy = -1; oy <= 1; oy++)
+        for (let ox = -1; ox <= 1; ox++) {
+          const X = gx + ox, Y = gy + oy
+          if (X < 0 || Y < 0 || X >= this.tgx || Y >= this.tgy) continue
+          const cell = Y * this.tgx + X
+          if (cell === lastCell) continue
+          for (const i of this.tgrid[cell]) {
+            if (this.tstamp[i] === gen) continue
+            this.tstamp[i] = gen
+            const t = this.trees[i]
+            // crown ellipsoid
+            const sx = (a[0] - t.cx) / t.r, sy = (a[1] - t.cy) / t.r, sz = (a[2] - t.cz) / t.rz
+            const ux = dx / t.r, uy = dy / t.r, uz = dz / t.rz
+            const A = ux * ux + uy * uy + uz * uz
+            if (A > 1e-9) {
+              const B = 2 * (sx * ux + sy * uy + sz * uz), C = sx * sx + sy * sy + sz * sz - 1
+              const g = B * B - 4 * A * C
+              if (g > 0) {
+                const q = Math.sqrt(g), t0 = (-B - q) / (2 * A), t1 = (-B + q) / (2 * A)
+                if (t1 >= 0 && t0 <= 1) u += (Math.min(t1, 1) - Math.max(t0, 0)) * L
+              }
+            }
+            // trunk: 2D distance from segment to trunk axis, within trunk height
+            const fx = a[0] - t.x, fy = a[1] - t.y, AA = dx * dx + dy * dy
+            if (AA > 1e-9) {
+              let tt = -(fx * dx + fy * dy) / AA
+              tt = Math.max(0, Math.min(1, tt))
+              const px = fx + dx * tt, py = fy + dy * tt
+              if (px * px + py * py < t.trunkR * t.trunkR) {
+                const zz = a[2] + dz * tt
+                if (zz >= t.z && zz <= t.trunkTop) return 0
+              }
+            }
+          }
+        }
+      lastCell = -1
+    }
+    return Math.exp(-this.canopyDensity * u)
+  }
+
+  /** Vision line of sight: buildings/terrain block, canopy fades, trunks block. */
+  sees(a: number[], b: number[]): boolean {
+    if (this.segHit(a, b) >= 0) return false
+    return this.canopy(a, b) >= this.canopyBlockT
   }
 }

@@ -3,7 +3,7 @@ import type { ActorObs, BotAction, Hello, Observation, PickupObs, SelfObs, Weapo
 import { World } from "./world.ts"
 
 const env = (globalThis as any).process?.env ?? {}
-export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1" }
+export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0" }
 const TAU = Math.PI * 2
 const wrap = (a: number) => {
   a = (a + Math.PI) % TAU
@@ -62,6 +62,7 @@ export class Brain {
   mode = "init"
   holdSpot: number[] | null = null
   holdKey = ""
+  holdRefineT = -100
   scanT = 0
   scanIdx = 0
   lastTargetId = -1
@@ -256,6 +257,32 @@ export class Brain {
     return dir
   }
 
+  concealCache = new Map<number, number>()
+  /** Fraction of viewing directions (70 m and 130 m out) from which a mech standing at (x,y) can't be seen. */
+  concealment(x: number, y: number): number {
+    const w = this.world
+    if (!w) return 0
+    const key = Math.floor((x - w.minX) / 4) * 4096 + Math.floor((y - w.minY) / 4)
+    const c = this.concealCache.get(key)
+    if (c !== undefined) return c
+    const g = w.ground(x, y)
+    const body = [x, y, g + 4.5], head = [x, y, g + 8.5]
+    let hidden = 0, n = 0
+    for (let k = 0; k < 12; k++) {
+      const b = (k / 12) * TAU + 0.13
+      for (const r of [70, 130]) {
+        const vx = x + Math.cos(b) * r, vy = y + Math.sin(b) * r
+        if (vx < w.minX || vx > w.maxX || vy < w.minY || vy > w.maxY) { hidden++; n++; continue }
+        const eye = [vx, vy, w.ground(vx, vy) + 8]
+        n++
+        if (!w.sees(eye, body) && !w.sees(eye, head)) hidden++
+      }
+    }
+    const v = hidden / n
+    this.concealCache.set(key, v)
+    return v
+  }
+
   /** Find a cover spot near `center` (within `rad`) inside the safe disk. */
   findHoldSpot(center: number[], rad: number, safeC: number[], safeR: number, threats: number[][]): number[] {
     const w = this.world
@@ -263,9 +290,9 @@ export class Brain {
     let best = center, bestS = -Infinity
     const t0 = performance.now()
     const z0 = 8
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < (OPT.stealth ? 60 : 40); i++) {
       if (performance.now() - t0 > 4 || this.left() < 3) break
-      const a = this.rng() * TAU, r = Math.sqrt(this.rng()) * rad
+      const a = this.rng() * TAU, r = i === 0 ? 0 : Math.sqrt(this.rng()) * rad
       const x = center[0] + Math.cos(a) * r, y = center[1] + Math.sin(a) * r
       if (!w.isFree(x, y, 3.2)) continue
       if (Math.hypot(x - safeC[0], y - safeC[1]) > safeR) continue
@@ -276,6 +303,7 @@ export class Brain {
         if (w.segHit([x, y, g + z0], [x + Math.cos(b) * 25, y + Math.sin(b) * 25, g + z0], false) >= 0) cover++
       }
       let s = Math.min(cover, 7) - r / 25
+      if (OPT.stealth) s = this.concealment(x, y) * 12 + Math.min(cover, 7) * 0.4 - r / 30
       for (const th of threats) if (w.los([x, y, g + z0], [th[0], th[1], th[2] + 6])) s -= 3
       if (s > bestS) { bestS = s; best = [x, y] }
     }
@@ -515,7 +543,11 @@ export class Brain {
       const eFrac = e.hp / e.maxHp
       let engage = attacker || dd < 70 || (hpFrac > 0.5 && (dd < 130 || (laser && dd < 240)))
       if (hpFrac > 0.4 && eFrac < 0.35 && dd < 200) engage = true
-      if (OPT.cautious && !attacker) {
+      if (OPT.stealth && !attacker) {
+        const toMe = Math.atan2(p[1] - e.pos[1], p[0] - e.pos[0])
+        const aware = Math.abs(angDiff(e.aim[0], toMe)) < 0.5
+        engage = dd < 45 || (aware && dd < 90) || (eFrac < 0.3 && hpFrac > 0.5 && dd < 120) || z.next_radius <= 25
+      } else if (OPT.cautious && !attacker) {
         const toMe = Math.atan2(p[1] - e.pos[1], p[0] - e.pos[0])
         const aware = Math.abs(angDiff(e.aim[0], toMe)) < 0.6 && dd < 210
         const busy = e.hp < e.maxHp * 0.85
@@ -534,7 +566,7 @@ export class Brain {
       for (const e of npcs) {
         const dd = d2(e.pos, p)
         const attacker = this.attackers.has(e.id) && t - this.attackers.get(e.id)!.t < 4
-        const farm = !mechThreatNear && hpFrac > 0.55 && dd < 90 && (gunOk || ltg || laser) && !zoneUrgent
+        const farm = !OPT.stealth && !mechThreatNear && hpFrac > 0.55 && dd < 90 && (gunOk || ltg || laser) && !zoneUrgent
         if ((attacker || farm) && visibleNow.has(e.id) && hasLos(e) && dd < bd) { bd = dd; npcTarget = e }
       }
     }
@@ -595,7 +627,8 @@ export class Brain {
     if (zoneUrgent && !(fightTarget && !outsideNow && tOut > needT * 1.2 + 3)) {
       this.mode = "zone"
       moveDir = this.navTo(obs, safePt, inCombat ? [] : avoid)
-      boost = outsideNow || needT * 1.15 + 2 > tOut || (me.energy > 50 && needT > 4)
+      const threatClose = mechs.some((e) => d2(e.pos, p) < 160)
+      boost = (outsideNow && (z.dps >= 35 || needT > 3)) || needT * 1.15 + 2 > tOut || (me.energy > 90 && needT > 6 && !threatClose)
     } else if (retreat && (target || recentlyHit)) {
       this.mode = "retreat"
       if (!this.retreatSpot || t - this.retreatSpotT > 1.5) {
@@ -736,6 +769,14 @@ export class Brain {
           }
           this.holdKey = hkey
         }
+        if (OPT.stealth && this.left() > 5 && t - this.holdRefineT > 1) {
+          // keep looking for a better-concealed spot nearby while it's quiet
+          this.holdRefineT = t
+          const rad = Math.min(70, Math.max(2, safeR * 0.6))
+          const cand = this.findHoldSpot(safePt, rad, safeC, Math.max(2, safeR), threatsPos)
+          const cs = this.concealment(cand[0], cand[1]), hs = this.concealment(this.holdSpot[0], this.holdSpot[1])
+          if (cs > hs + 0.12 && d2(cand, p) < 90) this.holdSpot = cand
+        }
         if (d2(this.holdSpot, p) > 2.5) moveDir = this.navTo(obs, this.holdSpot, avoid)
         // walk slowly (silently) when close
         const dh = d2(this.holdSpot, p)
@@ -743,6 +784,17 @@ export class Brain {
           const k = Math.min(1, 0.4 + dh / 40)
           moveDir = [moveDir[0] * k, moveDir[1] * k]
         }
+      }
+    }
+
+    if (OPT.stealth && !zoneUrgent && !fightTarget && !recentlyHit && (this.mode === "hold" || this.mode === "loot" || this.mode === "cube")) {
+      const heard = this.threatBearings.some((b) => t - b.t < 8 && b.kind !== "damage")
+      const known = mechs.some((e) => d2(e.pos, p) < 170)
+      if (heard || known) {
+        const l = Math.hypot(moveDir[0], moveDir[1])
+        const cap = 4.4 / walk
+        if (l > cap) moveDir = [(moveDir[0] / l) * cap, (moveDir[1] / l) * cap]
+        boost = false
       }
     }
 
@@ -803,6 +855,12 @@ export class Brain {
       if (l > 1) moveDir = [moveDir[0] / l, moveDir[1] / l]
     }
     act.move = [moveDir[0], moveDir[1]]
+    {
+      // keep an energy reserve for lightning and emergencies unless the zone is eating us
+      const reserve = ltg ? 45 : 30
+      const emergency = outsideNow || this.mode === "retreat" || (fightTarget?.charging ?? false) || t < this.stuckUntil
+      if (boost && me.energy < reserve && !emergency) boost = false
+    }
     act.boost = boost && Math.hypot(moveDir[0], moveDir[1]) > 0.3
 
     // ---- aim and fire
@@ -891,7 +949,7 @@ export class Brain {
     } else {
       if (!(laser && (laser.charge ?? 0) > 0)) this.laserHoldStart = -1
       // shoot crates for loot when it is calm
-      const calm = !mechThreatNear && t - this.lastDamageT > 6 && !zoneUrgent
+      const calm = !OPT.stealth && !mechThreatNear && t - this.lastDamageT > 6 && !zoneUrgent
       if (calm && gun && gunOk) {
         let best: { id: number; pos: number[]; hp: number } | null = null, bd = 70
         for (const [, m] of this.crates) {
@@ -944,6 +1002,12 @@ export class Brain {
       if (gun && !(gun.reload > 0) && (gun.ammo ?? 12) < (gun.stats.mag ?? 12) * 0.7 && t - this.lastDamageT > 1.5) act.reload = true
     }
     if (gun && (gun.ammo ?? 1) === 0 && !(gun.reload > 0)) act.reload = true
+    if (gun && !(gun.reload > 0) && !fire[gunSlot] && fightTarget) {
+      const mag = gun.stats.mag ?? 12, ammo = gun.ammo ?? mag
+      const tLos = hasLos(fightTarget)
+      const far = d2(fightTarget.pos, p) > (gun.stats.range ?? 230)
+      if ((ammo < mag * 0.5 && (!tLos || far)) || (ammo < mag * 0.25 && t - this.lastDamageT > 1.5)) act.reload = true
+    }
     act.aim = [wrap(aim[0]), clamp(aim[1], this.cfg.mech.min_pitch ?? -0.7, this.cfg.mech.max_pitch ?? 1.3)]
     act.fire = [fire[0], fire[1]]
     if (wantTake !== null) {
