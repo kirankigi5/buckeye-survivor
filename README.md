@@ -21,11 +21,11 @@ A Mech Royale (`mechfight/1`) bot written in TypeScript and run with Bun. It pla
 - **Combat:**
   - gun shots lead the target and fire only when the shot is lined up and not blocked;
   - the same gun lead stays commanded while lightning is firing or a laser is charging, so the arm gun keeps shooting; the torso slews to the beam only as that charge is about to release;
-  - laser charges fully and is released on target;
+  - laser is released on target only at full charge, or earlier when that charge would kill (cube damage included, plus the cook-off on a mortar carrier); a visible target is not dumped on a timer;
   - lightning fires whenever a target is in its cone;
   - mortar uses a ballistic solution and lobs over cover;
   - keeps its torso on the attacker to avoid ×1.5 rear damage, and strafes randomly (left / right / stop) to beat lead aiming;
-  - dodges charging lasers, incoming bullets, and mortar landings.
+  - dodges charging lasers, incoming bullets, and mortar landings. A bullet sidestep that would run toward a mech behind the torso is bent forward instead, because rear hits deal extra damage.
 - **Survival:** takes cover while reloading. Retreats out of line of sight when losing the damage trade, low on HP, or outnumbered. Turns toward and evades attackers it can't see.
 - **Upgrades:** armor > plating > gun damage > laser damage > nanites > the remaining upgrades.
 
