@@ -202,7 +202,7 @@ export class Brain {
     const goalMoved = !this.pathGoal || d2(this.pathGoal, goal) > Math.max(4, 0.1 * d2(p, goal))
     if (!this.path || goalMoved || t - this.pathT > 2.5 || this.path.length === 0) {
       if (d2(p, goal) < 3 || w.walkLine(p[0], p[1], goal[0], goal[1], 2.6)) this.path = [[goal[0], goal[1]]]
-      else this.path = w.path(p[0], p[1], goal[0], goal[1], Math.max(1.5, Math.min(7, this.left() - 3)), avoid)
+      else this.path = w.path(p[0], p[1], goal[0], goal[1], Math.max(1, Math.min(5, this.left() - 2)), avoid)
       this.pathGoal = goal
       this.pathT = t
     }
@@ -263,7 +263,7 @@ export class Brain {
     const t0 = performance.now()
     const z0 = 8
     for (let i = 0; i < 40; i++) {
-      if (performance.now() - t0 > 6 || this.left() < 4) break
+      if (performance.now() - t0 > 4 || this.left() < 3) break
       const a = this.rng() * TAU, r = Math.sqrt(this.rng()) * rad
       const x = center[0] + Math.cos(a) * r, y = center[1] + Math.sin(a) * r
       if (!w.isFree(x, y, 3.2)) continue
@@ -288,7 +288,7 @@ export class Brain {
     let best: number[] | null = null, bestS = -Infinity
     const t0 = performance.now()
     for (let i = 0; i < 36; i++) {
-      if (performance.now() - t0 > 5 || this.left() < 4) break
+      if (performance.now() - t0 > 4 || this.left() < 3) break
       const a = (i / 36) * TAU + this.rng() * 0.2
       const r = 18 + this.rng() * 40
       const x = p[0] + Math.cos(a) * r, y = p[1] + Math.sin(a) * r
@@ -360,7 +360,7 @@ export class Brain {
   // ---------------------------------------------------------------- main
   tickStart = 0
   /** ms left of this decision's compute budget */
-  left(total = 14) {
+  left(total = 9) {
     return total - (performance.now() - this.tickStart)
   }
 
