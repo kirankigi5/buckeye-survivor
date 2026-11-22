@@ -3,7 +3,7 @@ import type { ActorObs, BotAction, Hello, Observation, PickupObs, SelfObs, Weapo
 import { World } from "./world.ts"
 
 const env = (globalThis as any).process?.env ?? {}
-export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0" }
+export const OPT = { keepGun: env.MF_KEEPGUN === "1", noCover: env.MF_NOCOVER === "1", cautious: env.MF_CAUTIOUS === "1", hide: env.MF_HIDE === "1", lootR: Number(env.MF_LOOTR ?? 160), strafe: Number(env.MF_STRAFE ?? 1), sweep: env.MF_SWEEP === "1", stealth: env.MF_STEALTH !== "0", passive: env.MF_PASSIVE === "1", budget: Number(env.MF_BUDGET ?? 9), edge: env.MF_EDGE === "1", mover: env.MF_MOVE === "1", farm: env.MF_FARM !== "0", rush: env.MF_RUSH !== "0", equipFirst: env.MF_EQUIP_FIRST !== "0", duel: env.MF_DUEL !== "0", collectKill: env.MF_COLLECT_KILL !== "0" }
 const TAU = Math.PI * 2
 const wrap = (a: number) => {
   a = (a + Math.PI) % TAU
@@ -75,6 +75,7 @@ export class Brain {
   scanIdx = 0
   lastTargetId = -1
   lastTargetT = -100
+  lastKill: { pos: number[]; t: number } | null = null
   t = 0
 
   constructor(hello: Hello, shared?: World) {
@@ -179,6 +180,12 @@ export class Brain {
       } else if (ev.type === "hit") {
         this.lastDealT = t
         if (ev.target < 100) this.dealt.push({ t, a: ev.amount })
+      } else if (ev.type === "kill" && OPT.collectKill) {
+        const enemy = this.enemies.get(ev.target)
+        if (enemy) this.lastKill = { pos: enemy.pos, t }
+        this.enemies.delete(ev.target)
+        this.attackers.delete(ev.target)
+        this.taken = this.taken.filter((hit) => hit.by !== ev.target)
       } else if (ev.type === "take_failed") {
         this.badPickups.set(ev.id, t + (ev.reason === "range" ? 1 : 30))
         if (ev.reason === "gone") this.pickups.delete(ev.id)
@@ -584,6 +591,7 @@ export class Brain {
     // sound is only a search waypoint; it never creates a shootable enemy.
     let rushGoal: number[] | null = null
     let rushEnemy: Enemy | null = null
+    let rushReward = false
     if (!OPT.farm || !OPT.rush || t > 30 || me.cubes >= 2 || hpFrac < 0.6) {
       this.spawnRushDone = true
       this.spawnRushTarget = null
@@ -611,6 +619,7 @@ export class Brain {
         .sort((a, b) => d2(a.item.pos, p) - d2(b.item.pos, p))[0]
       if (reward && (!e || !visibleNow.has(e.id))) {
         rushGoal = reward.item.pos
+        rushReward = true
       } else if (this.spawnRushTarget && t - this.spawnRushSeen < 8) {
         rushGoal = this.spawnRushTarget
         rushEnemy = e
@@ -683,16 +692,37 @@ export class Brain {
       if (worst >= 0 && v > wv + 0.4) return { val: v - wv, drop: worst }
       return null
     }
+    let takeValue = -Infinity
     for (const pk of obs.pickups) {
       const dh = d2(pk.pos, p), dz = Math.abs(pk.pos[2] - p[2])
       if (dh <= (this.cfg.loot.pickup_radius ?? 4) - 0.2 && dz < 3.8) {
         const wnt = pickupWant(pk)
-        if (wnt) { wantTake = pk.id; wantDrop = wnt.drop; break }
+        if (!wnt) continue
+        const value = wnt.val * 10 - dh
+        if (value > takeValue) {
+          takeValue = value
+          wantTake = pk.id
+          wantDrop = wnt.drop
+        }
+        if (!OPT.equipFirst) break
       }
     }
 
     const inCombat = !!fightTarget || recentlyHit
     const unseenHit = !fightTarget && this.taken.some((x) => t - x.t < 2.5) && this.threatBearings.some((b) => b.kind === "damage" && t - b.t < 2.5)
+    let equipGoal: PickupObs | null = null
+    if (OPT.equipFirst && !rushReward && !target && !recentlyHit && !laser && !ltg && !zoneUrgent && t < 60) {
+      let bestDist = rushEnemy && d2(rushEnemy.pos, p) < 40 ? 20 : rushEnemy ? 55 : 115
+      for (const { item: pk } of this.pickups.values()) {
+        if (pk.kind !== "laser" && pk.kind !== "lightning") continue
+        const distance = d2(p, pk.pos)
+        if (distance >= bestDist || distance < (this.cfg.loot.pickup_radius ?? 4) - 0.2 || !pickupWant(pk)) continue
+        if (Math.abs(pk.pos[2] - (this.world?.ground(pk.pos[0], pk.pos[1]) ?? pk.pos[2])) > 2 || !ptOk(pk.pos)) continue
+        if (mechs.some((e) => d2(e.pos, pk.pos) < 50)) continue
+        bestDist = distance
+        equipGoal = pk
+      }
+    }
     const taken6 = this.taken.reduce((a, x) => a + x.a, 0)
     const dealt6 = this.dealt.reduce((a, x) => a + x.a, 0)
     const nearEnemies = mechs.filter((e) => d2(e.pos, p) < 120).length
@@ -702,6 +732,11 @@ export class Brain {
       if (hpFrac < 0.33 && (eFrac > hpFrac + 0.05 || nearEnemies > 1)) retreatNow = true
       if (hpFrac < this.retreatHp && taken6 > dealt6 * 1.5 + 250 && eFrac > 0.3) retreatNow = true
       if (nearEnemies > 2 && hpFrac < 0.7) retreatNow = true
+      if (OPT.duel && eFrac > 0.3) {
+        const attackers = new Set(this.taken.filter((x) => t - x.t < 2.5 && x.by !== undefined && x.by >= 0 && x.by < 16).map((x) => x.by))
+        if (hpFrac < 0.75 && attackers.size >= 2) retreatNow = true
+        if (hpFrac < 0.65 && taken6 - dealt6 > 260 && target.hp > me.hp + 150) retreatNow = true
+      }
     }
     if (retreatNow) this.retreatUntil = t + 2.5
     const retreat = t < this.retreatUntil && z.next_radius > 30 && !(target && target.hp / target.maxHp < 0.15 && hasLos(target))
@@ -711,6 +746,10 @@ export class Brain {
       moveDir = this.navTo(obs, safePt, inCombat ? [] : avoid)
       const threatClose = mechs.some((e) => d2(e.pos, p) < 160)
       boost = (outsideNow && (z.dps >= 35 || needT > 3)) || needT * 1.15 + 2 > tOut || (me.energy > 90 && needT > 6 && !threatClose)
+    } else if (equipGoal && !retreat) {
+      this.mode = "equip"
+      moveDir = this.navTo(obs, equipGoal.pos, avoid)
+      boost = me.energy > 60 && d2(equipGoal.pos, p) > 15
     } else if (rushGoal && !retreat) {
       this.mode = "rush"
       const dd = d2(rushGoal, p)
@@ -772,7 +811,28 @@ export class Brain {
       let radial = 0
       if (dd > pref + 15) radial = hpFrac > 0.45 ? 0.7 : 0
       else if (dd < pref - 15) radial = -0.6
-      let mx = -uy * this.strafeSign + ux * radial, my = ux * this.strafeSign + uy * radial
+      const lrng = ltg?.stats.range ?? 45
+      let lateral = this.strafeSign
+      let closing = false
+      if (OPT.duel && !e.npc && hasLos(e)) {
+        const ownRangeAdvantage = ltg && !eHasLtg && hpFrac > 0.55 && nearEnemies < 2 && me.energy > 35
+        const finishing = e.hp < e.maxHp * 0.25 && e.hp + 300 < me.hp && nearEnemies < 2 && gunOk
+        const theirRange = this.cfg.weapons.lightning.range ?? 45
+        if ((ownRangeAdvantage && dd > lrng * 0.8 && dd < lrng + 50) || (finishing && dd > 34 && dd < 105)) {
+          closing = true
+          radial = 1
+          lateral *= 0.4
+          boost = me.energy > (ltg ? 55 : 40)
+        } else if (eHasLtg && (!ltg || laser) && dd < theirRange + 13) {
+          radial = -1
+          lateral *= 0.65
+          boost = me.energy > 35
+        } else if (!ltg && !eHasLtg && gunOk && !laser && dd > 65 && dd < 125 && hpFrac > 0.6 && nearEnemies < 2) {
+          // Shot spread and lead error scale with range. Close an isolated gun duel.
+          radial = 0.65
+        }
+      }
+      let mx = -uy * lateral + ux * radial, my = ux * lateral + uy * radial
       // dodge a laser that is charging at us
       if (e.charging && Math.abs(angDiff(e.aim[0], Math.atan2(-dy, -dx))) < 0.25) {
         const sg = this.strafeSign || 1
@@ -785,9 +845,8 @@ export class Brain {
         const k = clamp((d2(p, safeC) - safeR) / 30, 0, 1)
         mx += (zx / zl) * k; my += (zy / zl) * k
       }
-      const lrng = ltg?.stats.range ?? 45
       const canFireSoon = gunOk || (!!laser && laser.cooldown < 0.7) || (!!ltg && dd < lrng && me.energy > 8) || (!!mortar && mortar.cooldown < 0.7 && dd > 22)
-      if (!OPT.noCover && !canFireSoon && !e.npc && hasLos(e) && dd > 30) {
+      if (!OPT.noCover && !canFireSoon && !closing && !e.npc && hasLos(e) && dd > 30) {
         this.mode = "cover"
         if (!this.retreatSpot || t - this.retreatSpotT > 1.5) {
           this.retreatSpot = this.findRetreat(p, threatsPos.length ? threatsPos : [e.pos], safeC, Math.max(safeR + marginNext * 0.8, 20))
@@ -814,6 +873,23 @@ export class Brain {
           goalKind = "drop"
           if (dd < dr.radius - 2) goal = [p[0], p[1]]
           break
+        }
+      }
+      // A kill can drop several cubes. Collect them before leaving for a pickup.
+      const kill = this.lastKill
+      if (kill && !goal && t - kill.t < 8 && ![...this.attackers.values()].some((a) => t - a.t < 2.5) && !mechs.some((e) => d2(e.pos, p) < 75)) {
+        let closest = 100
+        for (const { item: cube } of this.cubes.values()) {
+          const distance = d2(p, cube.pos)
+          if (distance < closest && d2(cube.pos, kill.pos) < 15 && Math.abs(cube.pos[2] - kill.pos[2]) < 4 && ptOk(cube.pos)) {
+            closest = distance
+            goal = cube.pos
+            goalKind = "kill-cubes"
+          }
+        }
+        if (!goal && d2(p, kill.pos) > 6 && d2(p, kill.pos) < 75 && ptOk(kill.pos)) {
+          goal = kill.pos
+          goalKind = "kill-cubes"
         }
       }
       // weapons
@@ -870,6 +946,7 @@ export class Brain {
         this.mode = goalKind
         this.holdSpot = null
         moveDir = d2(goal, p) < 0.6 ? [0, 0] : this.navTo(obs, goal, avoid)
+        if (goalKind === "kill-cubes" && me.energy > 65 && d2(goal, p) > 20) boost = true
         if (goalKind === "drop" && d2(goal, p) < 3) moveDir = [0, 0]
       } else {
         this.mode = "hold"
@@ -1083,7 +1160,7 @@ export class Brain {
     } else {
       if (!(laser && (laser.charge ?? 0) > 0)) this.laserHoldStart = -1
       // shoot crates for loot when it is calm
-      const calm = this.mode !== "rush" && (OPT.farm || !OPT.stealth) && !mechThreatNear && t - this.lastDamageT > 6 && !zoneUrgent
+      const calm = this.mode !== "rush" && this.mode !== "equip" && (OPT.farm || !OPT.stealth) && !mechThreatNear && t - this.lastDamageT > 6 && !zoneUrgent
       if (calm && ((gun && gunOk) || (ltg && me.energy > 40))) {
         let best: { id: number; pos: number[]; hp: number } | null = null, bd = OPT.farm ? 90 : 70
         for (const [, m] of this.crates) {

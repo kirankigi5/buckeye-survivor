@@ -75,3 +75,40 @@ test("low health cancels the opening objective", () => {
   const { b, o } = fixture(); b.act(o); step(o); o.self.hp = 600
   b.act(o); assert.equal(b.spawnRushDone, true); assert.notEqual(b.mode, "rush")
 })
+
+test("takes a short detour for a laser before committing to a distant drone", () => {
+  const { b, o } = fixture()
+  o.pickups = [{ id: 8000, kind: "laser", pos: [0, 40, 0] }]
+  const action = b.act(o)
+  assert.equal(b.mode, "equip")
+  assert.ok(action.move![1] > 0.9)
+  assert.equal(action.boost, true)
+})
+
+test("prefers a laser to an in-range mortar", () => {
+  const { b, o } = fixture()
+  o.pickups = [
+    { id: 8000, kind: "mortar", pos: [1, 0, 0] },
+    { id: 8001, kind: "laser", pos: [2, 0, 0] },
+  ]
+  assert.equal(b.act(o).take, 8001)
+})
+
+test("clears the defeated attacker and moves to its dropped cubes", () => {
+  const { b, o, drone } = fixture()
+  const enemy = { ...drone, id: 1, kind: "mech", hp: 30, max_hp: 1400 }
+  o.mechs = [enemy]
+  o.events = [{ type: "damaged", by: 1, weapon: "gun", bearing: 0, amount: 45 }]
+  b.act(o)
+  step(o)
+  o.mechs = []
+  o.events = [{ type: "kill", target: 1 }]
+  o.cubes = [{ id: 5000, pos: [60, 1, 0] }]
+  o.pickups = [{ id: 8000, kind: "mortar", pos: [0, 25, 0] }]
+  const action = b.act(o)
+  assert.equal(b.enemies.has(1), false)
+  assert.equal(b.attackers.has(1), false)
+  assert.equal(b.mode, "kill-cubes")
+  assert.ok(action.move![0] > 0.9)
+  assert.deepEqual(action.fire, [false, false])
+})
