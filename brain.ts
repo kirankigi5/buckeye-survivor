@@ -556,6 +556,9 @@ export class Brain {
     const [mortar, mortarSlot] = this.weapon(me, "mortar")
     const gunOk = !!gun && (gun.ammo ?? 1) > 0 && !(gun.reload > 0)
 
+    // Last portion of the match, or a small circle: stop picking fights.
+    const lateCaution = t >= 268 || z.next_radius <= 96 || z.radius <= 125
+
     // ---- choose a target
     const recentlyHit = t - this.lastDamageT < 4
     let target: Enemy | null = null
@@ -575,6 +578,7 @@ export class Brain {
         const toMe = Math.atan2(p[1] - e.pos[1], p[0] - e.pos[0])
         const aware = Math.abs(angDiff(e.aim[0], toMe)) < 0.5
         engage = dd < 45 || (aware && dd < 90) || (eFrac < 0.3 && hpFrac > 0.5 && dd < 120) || z.next_radius <= 25
+        if (lateCaution && !attacker) engage = dd < 28 || z.next_radius <= 25
       } else if (OPT.cautious && !attacker) {
         const toMe = Math.atan2(p[1] - e.pos[1], p[0] - e.pos[0])
         const aware = Math.abs(angDiff(e.aim[0], toMe)) < 0.6 && dd < 210
@@ -594,7 +598,7 @@ export class Brain {
       for (const e of npcs) {
         const dd = d2(e.pos, p)
         const attacker = this.attackers.has(e.id) && t - this.attackers.get(e.id)!.t < 4
-        const farm = (OPT.farm || !OPT.stealth) && !mechThreatNear && hpFrac > (OPT.farm ? 0.45 : 0.55) && dd < (OPT.farm ? 130 : 90) && (gunOk || ltg || laser || (gun && hpFrac > 0.7)) && !zoneUrgent
+        const farm = !lateCaution && (OPT.farm || !OPT.stealth) && !mechThreatNear && hpFrac > (OPT.farm ? 0.45 : 0.55) && dd < (OPT.farm ? 130 : 90) && (gunOk || ltg || laser || (gun && hpFrac > 0.7)) && !zoneUrgent
         if ((attacker || farm) && visibleNow.has(e.id) && hasLos(e) && dd < bd) { bd = dd; npcTarget = e }
       }
     }
@@ -952,6 +956,7 @@ export class Brain {
           }
         }
       }
+      if (lateCaution && goal && goalKind !== "kill-cubes" && goalKind !== "drop") goal = null
       if (goal && safeTime < 5) goal = null
       if (goal) {
         this.mode = goalKind
