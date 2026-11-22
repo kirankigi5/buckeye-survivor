@@ -195,6 +195,18 @@ test("gun keeps firing on its own lead while a laser is still charging", () => {
   assert.equal(second.fire![1], true)
 })
 
+test("keeps a weakening target we have already hit", () => {
+  const { b, o } = fixture()
+  step(o, 40)
+  o.mechs = [
+    { id: 3, kind: "mech", pos: [15, 0, 0], vel: [0, 0, 0], aim: [0, 0], hp: 1400, max_hp: 1400, weapons: ["gun"], charging: false },
+    { id: 4, kind: "mech", pos: [42, 4, 0], vel: [0, 0, 0], aim: [0, 0], hp: 1100, max_hp: 1400, weapons: ["gun"], charging: false },
+  ]
+  o.events = [{ type: "hit", target: 4, amount: 90, weapon: "gun" }]
+  b.act(o)
+  assert.equal(b.lastTargetId, 4)
+})
+
 test("uses the most imminent shot when two shots call for opposite moves", () => usePredictiveDodge(() => {
   const { b, o } = fixture()
   o.mechs = []
